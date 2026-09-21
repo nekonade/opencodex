@@ -9,7 +9,7 @@
 - 計画の正本: /Users/iris/Applications/worktree/5bc3/opencodex
 - 作成日: 2026/09/21
 - 最終更新: 2026/09/21
-- Rev: 1
+- Rev: 2
 - chat_id: /Users/iris/.codex/sessions/2026/09/21/rollout-2026-09-21T17-43-48-01a0c322-b9b6-7f11-95c1-1978384c3f31.jsonl
 - 保存先確認: 2026/09/21、ユーザーがこのworktreeのdocs配下を指定。
 - 関連: 引き継ぎ元タスク 01a0c321-244e-7733-b98b-27a488c991ee、[upstream v2.60.0](https://github.com/lidge-jun/opencodex/releases/tag/v2.60.0)
@@ -40,7 +40,7 @@
 - 作業ツリーの起点はv2.15.0、`1a937d834def5f025188c3046dbcd7a31f45a42a`。この古いツリーに実装修正は行わない。
 - GitHubの最新公開リリースはv2.60.0。ローカルに既存の同タグ `7c625fc9755c9824653ab944190e243091a2c85c` があり、`git show`／`git grep`で読み取り調査した。fetch・merge・checkoutによる取り込みはしていない。
 - 以下のパスと行番号はすべてv2.60.0のもの。現在の作業ツリーの行番号ではない。
-- `gh-ai` による追加のGitHub API調査は、専用アカウントのKeychain資格情報取得失敗で停止。別アカウントや別認証へ切り替えていない。
+- Rev.1時点の `gh-ai` 調査は専用アカウントのKeychain資格情報取得失敗で停止。その後ユーザーが通常の `gh` 使用・`gh-ai` 不使用を明示したため、Rev.2で通常の `gh` による読み取り検索を実施した。アカウント切替や資格情報変更は行っていない。
 
 | 確認対象 | v2.60.0の確認結果 | 根拠パス・行 |
 |---|---|---|
@@ -60,6 +60,19 @@
 **原因候補:** デバイスコードがまだ有効でも、GUIが先に待機を打ち切り `cancelServerLogin` → `cancelLoginFlow` → AbortControllerで認証を中断する。コード上の不整合は確認済みで、ユーザーの実際の失敗との因果は未実測。数秒で失敗する場合はKeychainの5秒、検証10秒、デバイス要求20秒等を別に切り分ける。
 
 参考ソース: [認証追加画面](https://github.com/lidge-jun/opencodex/blob/v2.60.0/gui/src/components/use-add-provider-oauth.ts)、[Museデバイス認証](https://github.com/lidge-jun/opencodex/blob/v2.60.0/src/oauth/meta-muse-device.ts)、[web_search互換処理](https://github.com/lidge-jun/opencodex/blob/v2.60.0/src/adapters/openai-responses/web-search.ts)。リンク先に対応するローカルタグのソースで内容を確認した。
+
+### upstream Issueの重複確認（2026/09/21 18:03 JST）
+
+ユーザー指定の通常の `gh issue list --repo lidge-jun/opencodex --state all --search ... --limit 100` でopen・closed両方を検索し、関連候補は `gh issue view` で本文・コメント・終了理由を確認した。検索語は `muse`、`search_content_types`、`"meta" "timeout"`、`"oauth" "timeout"`、`"login" "timed out"`、`"login" "timeout"`、`"meta-muse" "login"`。各結果は100件未満で、上限による打ち切りはない。
+
+| Issue | 確認時の状態 | 今回の2件との関係 |
+|---|---|---|
+| [#2442](https://github.com/lidge-jun/opencodex/issues/2442) OpenCode Go Responses rejects search_content_types on web_search | CLOSED / COMPLETED | 同一エラーの先行報告。ただしOpenCode Go＋1.2-contributor。devで修正済みとしてclose。今回のdirect Meta＋通常1.3とは条件が異なる |
+| [#3362](https://github.com/lidge-jun/opencodex/issues/3362) OpenCode Go Muse Spark 1.3 rejects indexed_web_access | CLOSED / NOT_PLANNED | Go＋1.3-contributorの別フィールド拒否。問題否定ではなく#3378へ統合してclose |
+| [#3378](https://github.com/lidge-jun/opencodex/issues/3378) OpenCode Go wire contract | CLOSED / COMPLETED | #3405、commit 20011a1c482c1e4051c2ec1c52d0ee9ca9164d6cで修正との終了コメント。今回の通常1.3 direct Metaを解決済みとは判断しない |
+| [#3191](https://github.com/lidge-jun/opencodex/issues/3191) Muse Code subscription routing through a process-backed MSP adapter | OPEN | Muse CLI経由の新しい接続方式の機能要望。今回のHTTP web_search互換性・GUI認証期限の不具合とは別件 |
+
+**検索範囲の結論:** direct Meta＋通常 `muse-spark-1.3` の今回の400と、Muse追加画面の200秒／300秒打ち切りに一致するIssueは見つからなかった。同種のweb_search不具合の過去Issueは存在するが、一致するopen Issueを確認できたわけではない。表記差・検索索引の遅延等を含むため「存在しない」と断定しない。投稿する場合は直前に再検索する。今回Issue作成・コメント・再openは行っていない。
 
 ## 3. スコープ
 
@@ -91,6 +104,7 @@
 | D6 | 認証タイムアウトを追加の修正対象とし、人の認証待ちと単一通信の期限を分けて設計する | 今回の追加要望 | HTTP全体のtimeoutだけを一律に延ばす案 |
 | D7 | テストは時計・fetch・Keychainをモックし、期限境界とキャンセル競合を確認する | 長時間実待機と外部認証を自動テストから除く | 実Meta認証だけで自動検証する案 |
 | D8 | 計画ファイルだけをgit-safetyでcommitし、pushしない | 指定スキル。TODO・MEMOは別の作業記録 | git add -Aによる一括commit |
+| D9 | 今回のupstream Issue検索は通常のghを使用し、gh-aiを使用しない | ユーザーの明示指示 | gh-aiの再試行。外部投稿の許可は含まない |
 
 具体的なモデル追加範囲、期限APIの形式、余裕時間の値は決定しておらず、§5の候補と§9で管理する。
 
@@ -276,10 +290,11 @@ bun run privacy:scan
 | U4 | CLI account-authの短い待機も修正するか | 影響を提示しスコープを決定 |
 | U5 | 別作業の状態、最新upstreamの取り込み手順・基点 | 実装開始指示後に既存作業を確認 |
 | U6 | 実認証・実API検証と外部共有の範囲 | Human手順・投稿下書きを準備した段階で必要な許可を確認 |
-| U7 | upstream Issueの重複・関連PRの最新状態 | gh-ai利用が可能になった後に再確認。元調査を最新事実として使わない |
+| U7 | 投稿直前のIssue重複再確認と関連PRの最新状態 | Rev.2で通常のghにより既存Issueを検索済み（§2）。今回の条件に一致する報告は見つからず。PR #3964等の最新状態は別途確認が必要 |
 
 保存先の初回確認は回答済み。計画確定・実装開始はいずれも未承認。
 
 ## 10. 改訂履歴
 
 - Rev.1 2026/09/21 — 引き継ぎweb_search案を初めてファイル保存。認証タイムアウトの調査・設計候補・テストを追加し、最新upstream取り込みを将来実装の前提に明記。／理由: ユーザーの追加要望とworktree内docsへの保存指定。v2.60.0をローカルタグから読み取り確認し、旧計画のパス・実測範囲を整理。statusはdraftのまま。
+- Rev.2 2026/09/21 — §2にupstream Issue検索結果と先行Issueの相違・終了理由を追加、D9を追加、U7を更新。／理由: ユーザー指示「ghコマンドでupstreamにこの件のISSUEが存在するか確認」「gh-aiは使わない」。一致するIssueは検索範囲では未発見。外部投稿・実装は行わずdraftを維持。
