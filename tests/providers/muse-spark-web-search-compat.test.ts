@@ -289,6 +289,30 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
     }
   });
 
+  test("direct Meta preserves other ordinary 1.3 web_search options at both tool positions", () => {
+    const webSearchWithOptions = {
+      ...webSearchTool(),
+      user_location: { type: "approximate", country: "JP" },
+      filters: { allowed_domains: ["example.com"] },
+    };
+    const body = buildForProvider(META_PROVIDER, "muse-spark-1.3", {
+      tools: [webSearchWithOptions],
+      input: [{ type: "additional_tools", tools: [webSearchWithOptions] }],
+    });
+    const topLevel = toolsOf(body)[0]!;
+    const inputItem = (body.input as Array<Record<string, unknown>>)[0]!;
+    const nested = (inputItem.tools as Array<Record<string, unknown>>)[0]!;
+
+    for (const declaration of [topLevel, nested]) {
+      expect(declaration.type).toBe("web_search");
+      expect(Object.hasOwn(declaration, "search_content_types")).toBe(false);
+      expect(Object.hasOwn(declaration, "indexed_web_access")).toBe(false);
+      expect(declaration.search_context_size).toBe("medium");
+      expect(declaration.user_location).toEqual({ type: "approximate", country: "JP" });
+      expect(declaration.filters).toEqual({ allowed_domains: ["example.com"] });
+    }
+  });
+
   test("direct Meta remains destination-scoped when the model id is unavailable", () => {
     const body = { tools: [webSearchTool()] };
     const rewritten = stripMuseSparkUnsupportedWebSearchFields(body, undefined, "https://api.meta.ai/v1/responses") as {

@@ -258,6 +258,11 @@ Cline IDE/CLI のみで API からは使えません。`minimax/minimax-m2.5` �
 | Cloudflare AI Gateway | `https://gateway.ai.cloudflare.com/v1/{account-id}/{gateway}/anthropic` |
 | …その他多数 | opencode zen、Vercel AI Gateway、Venice、NanoGPT、Synthetic、Qianfan、Alibaba、Parallel、ZenMux、LiteLLM |
 
+Meta の直接 `/v1/responses` エンドポイントでは、Meta側が拒否する `search_content_types` と
+`indexed_web_access` を通常の `web_search` から除去します。この判定はモデルIDではなく接続先に
+基づくため、通常の `muse-spark-1.3` と `muse-spark-1.2` の両方に適用されます。他の検索オプションと
+`web_search_preview` の形式は保持されます。
+
 **OpenCode Zen**（`opencode-zen`）とキー不要の **OpenCode Free** プリセットは
 `https://opencode.ai/zen/v1` を共有します。このゲートウェイ上の無料モデルは、しばしばおおよそ毎分 15–20 リクエストの短時間レート制限に当たります（コミュニティ計測。OpenCode は RPM を公表しません）。Zen は `Retry-After` / `X-RateLimit-*` ヘッダーなしの汎用 429 を返すことがあります。これはキー不要デスクトップ枠（`opencode-free` で Big Pickle/無料モデル約 200 回 / 5 時間）とは別です。Zen がそのような 429 で `Retry-After` を省略した場合、opencodex はクライアント向けエラーに案内を足し、合成 `Retry-After` を付けます（上流の `Retry-After` があればそれが優先されます）。同一キーの待機再試行は [`retryOn429`](/ja/reference/configuration/) でオプトインします。
 

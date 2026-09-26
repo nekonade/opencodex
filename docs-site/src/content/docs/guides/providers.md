@@ -740,6 +740,11 @@ models are seeded — `meta-model/muse-spark-1.3` and `meta-model/muse-spark-1.3
 Discovery stays off until an authenticated roster is verified, because Meta serves image and
 voice models on the same host.
 
+On Meta's direct `/v1/responses` endpoint, opencodex removes `search_content_types` and
+`indexed_web_access` from plain `web_search` declarations because the gateway rejects those
+fields. The rule is scoped to the Meta destination, so it applies regardless of the model ID;
+other `web_search` options and the `web_search_preview` shape are preserved.
+
 Two things worth knowing before you pick it. **A Muse Code subscription does not apply
 here:** Meta scopes that credential to the Muse Code CLI and bills any other key
 pay-as-you-go. And the Contributor tier is cheap because Meta trains on your prompts —
