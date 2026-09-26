@@ -307,7 +307,8 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
       expect(declaration.type).toBe("web_search");
       expect(Object.hasOwn(declaration, "search_content_types")).toBe(false);
       expect(Object.hasOwn(declaration, "indexed_web_access")).toBe(false);
-      // MetaはsupportsOpenAiWebSearchToolFields: falseを宣言していないため、共通オプションは維持される。
+      // Meta does not declare supportsOpenAiWebSearchToolFields: false; only xAI does
+      // (src/providers/registry/entries-core.ts:249), so shared options survive.
       expect(declaration.search_context_size).toBe("medium");
       expect(declaration.user_location).toEqual({ type: "approximate", country: "JP" });
       expect(declaration.filters).toEqual({ allowed_domains: ["example.com"] });
@@ -362,6 +363,7 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
   });
 
   test("non-exact Meta response URLs leave the original body untouched", () => {
+    // Keep this synthetic credentialed URL split so privacy:scan does not flag a literal secret pattern.
     const credentialedMetaUrl = ["https://", "user", ":", "password", "@api.meta.ai/v1/responses"].join("");
     const rejectedUrls = [
       "https://api.meta.ai/v1/responses?mode=test",

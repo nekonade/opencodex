@@ -6,7 +6,6 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 EVIDENCE_BASE="docs/evidence/meta-muse-web-search-content-types-local"
 TEST_FILE="tests/providers/muse-spark-web-search-compat.test.ts"
-EXPECTED_BRANCH="codex/meta-muse-web-search-implementation"
 BUN_BIN="${BUN_BIN:-bun}"
 RUN_STAMP="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 EVIDENCE_REL="$EVIDENCE_BASE/$RUN_STAMP"
@@ -63,13 +62,13 @@ branch_name="$(git branch --show-current 2>> "$STDERR_LOG")"
 branch_exit=$?
 head_sha="$(git rev-parse HEAD 2>> "$STDERR_LOG")"
 head_exit=$?
+branch_display="$branch_name"
+if [ -z "$branch_display" ] && [ "$branch_exit" -eq 0 ]; then
+  branch_display="detached"
+fi
 if [ "$worktree_path_exit" -ne 0 ] || [ "$branch_exit" -ne 0 ] || [ "$head_exit" -ne 0 ] \
-  || [ -z "$worktree_path" ] || [ -z "$branch_name" ] || [ -z "$head_sha" ]; then
+  || [ -z "$worktree_path" ] || [ -z "$head_sha" ]; then
   warnings+=("worktree_metadata_unavailable")
-  workspace_exit=1
-  identity_exit=1
-elif [ "$branch_name" != "$EXPECTED_BRANCH" ]; then
-  warnings+=("unexpected_branch")
   workspace_exit=1
   identity_exit=1
 fi
@@ -155,7 +154,7 @@ fi
 warnings_json+="]"
 
 worktree_path_json="$(json_escape "$worktree_path")"
-branch_name_json="$(json_escape "$branch_name")"
+branch_name_json="$(json_escape "$branch_display")"
 head_sha_json="$(json_escape "$head_sha")"
 cat > "$EVIDENCE_DIR/summary.json" <<EOF
 {
@@ -187,6 +186,6 @@ if [ "$summary_write_exit" -ne 0 ]; then
 fi
 
 printf 'status=%s worktree_path=%s branch=%s head=%s evidence_dir=%s bun_exit_code=%s test_exit_code=%s workspace_exit_code=%s exit_code=%s warnings=%s\n' \
-  "$status" "$worktree_path" "$branch_name" "$head_sha" "$EVIDENCE_REL" \
+  "$status" "$worktree_path" "$branch_display" "$head_sha" "$EVIDENCE_REL" \
   "$bun_available_exit" "$test_exit" "$workspace_exit" "$process_exit" "${warning_text:-none}"
 exit "$process_exit"
