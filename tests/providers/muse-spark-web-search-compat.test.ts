@@ -307,9 +307,80 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
       expect(declaration.type).toBe("web_search");
       expect(Object.hasOwn(declaration, "search_content_types")).toBe(false);
       expect(Object.hasOwn(declaration, "indexed_web_access")).toBe(false);
+      // MetaはsupportsOpenAiWebSearchToolFields: falseを宣言していないため、共通オプションは維持される。
       expect(declaration.search_context_size).toBe("medium");
       expect(declaration.user_location).toEqual({ type: "approximate", country: "JP" });
       expect(declaration.filters).toEqual({ allowed_domains: ["example.com"] });
+    }
+  });
+
+  test("removes only present rejected fields without mutating or repeatedly cloning the input", () => {
+    const fieldCases: Array<[string, Record<string, unknown>]> = [
+      ["both fields", { search_content_types: ["text", "image"], indexed_web_access: true }],
+      ["search_content_types only", { search_content_types: ["text"] }],
+      ["indexed_web_access only", { indexed_web_access: true }],
+      ["neither field", {}],
+    ];
+
+    for (const [label, rejectedFields] of fieldCases) {
+      const sourceTool = {
+        type: "web_search",
+        ...rejectedFields,
+        search_context_size: "medium",
+        user_location: { type: "approximate", country: "JP" },
+        filters: { allowed_domains: ["example.com"] },
+      };
+      const body = { tools: [sourceTool] };
+      const original = structuredClone(body);
+      const rewritten = stripMuseSparkUnsupportedWebSearchFields(
+        body,
+        "muse-spark-1.3",
+        "https://api.meta.ai/v1/responses",
+      ) as typeof body;
+      const reapplied = stripMuseSparkUnsupportedWebSearchFields(
+        rewritten,
+        "muse-spark-1.3",
+        "https://api.meta.ai/v1/responses",
+      );
+
+      expect(body, `${label}: source body is unchanged`).toEqual(original);
+      expect(sourceTool, `${label}: original tool retains its input fields`).toEqual(original.tools[0]);
+      expect(reapplied, `${label}: reapplying the rewrite preserves identity`).toBe(rewritten);
+      if (Object.keys(rejectedFields).length > 0) {
+        expect(rewritten, `${label}: a change returns a new body`).not.toBe(body);
+        expect(rewritten.tools[0], `${label}: a changed tool is copied`).not.toBe(sourceTool);
+      } else {
+        expect(rewritten, `${label}: an already-clean body keeps identity`).toBe(body);
+      }
+      expect(rewritten.tools[0]).toEqual({
+        type: "web_search",
+        search_context_size: "medium",
+        user_location: { type: "approximate", country: "JP" },
+        filters: { allowed_domains: ["example.com"] },
+      });
+    }
+  });
+
+  test("non-exact Meta response URLs leave the original body untouched", () => {
+    const credentialedMetaUrl = ["https://", "user", ":", "password", "@api.meta.ai/v1/responses"].join("");
+    const rejectedUrls = [
+      "https://api.meta.ai/v1/responses?mode=test",
+      "https://api.meta.ai/v1/responses#fragment",
+      credentialedMetaUrl,
+      "not a URL",
+      "https://other.example/v1/responses",
+      "https://api.meta.ai.example/v1/responses",
+      "https://api.meta.ai/v1/chat/completions",
+      "http://api.meta.ai/v1/responses",
+      "https://api.meta.ai:8443/v1/responses",
+    ];
+
+    for (const responseUrl of rejectedUrls) {
+      const body = { tools: [webSearchTool()] };
+      expect(
+        stripMuseSparkUnsupportedWebSearchFields(body, undefined, responseUrl),
+        responseUrl,
+      ).toBe(body);
     }
   });
 
