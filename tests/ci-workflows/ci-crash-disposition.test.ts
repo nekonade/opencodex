@@ -424,8 +424,8 @@ describe.skipIf(process.platform === "win32")("the hosted batch runner, executed
     expect(`status:${run.status}`, run.output).toBe("status:124");
     expect(run.output).toContain("timed out after 1s");
     expect(singletonCalls(run)).toHaveLength(FIRST_BATCH.length);
-    // Its child ignored TERM; the group KILL after the grace period removed it anyway, which is
-    // also why this run returned at all: the child held the output pipe open.
+    // The group KILL removes its TERM-ignoring child after the grace period. The fallback buffers
+    // output to a file until it returns, so an inherited fd cannot hold a tee pipe open.
     expect(run.childPid).toBeGreaterThan(0);
     expect(processGone(run.childPid!)).toBe(true);
   }, SPAWN_BUDGET_MS);

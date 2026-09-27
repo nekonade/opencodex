@@ -74,6 +74,8 @@ export interface ManagementApiDeps {
    * OPENCODEX_HOME (incident: devlog 260730.../070).
    */
   saveConfigPreservingClaudeCode?: (config: OcxConfig) => void;
+  /** Codex toggle seam: route fixtures avoid probing the host service manager. */
+  syncModelsToCodex?: typeof import("../../codex/sync").syncModelsToCodex;
   /**
    * Catalog seam for the Grok toggle (WP2, devlog 260803_integrations_toggle_all
    * Rev 3 N2). Production leaves this unset and the route dynamic-imports the

@@ -383,9 +383,11 @@ export const SERIAL_FULL_SUITE_FILES = [
   "server/server-live.test.ts",
   // These exercise the default-home service authority, shared by parallel Bun workers.
   // A fresh process/home prevents another file's authority from becoming this fixture's input.
+  "service/service-claim.test.ts",
   "service/service-ownership-state.test.ts",
   "service/service-sqlite-home.test.ts",
   "service/service.test.ts",
+  "service/service-wsl-home-ownership.test.ts",
   "codex-integration/native-grok-toggle.test.ts",
 ] as const;
 

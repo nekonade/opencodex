@@ -84,7 +84,7 @@ run_with_batch_deadline() {
   perl -e 'setpgrp(0, 0) or die "setpgrp: $!\n"; exec { $ARGV[0] } @ARGV or die "exec $ARGV[0]: $!\n";' -- "$@" &
   child=$!
 
-  # Output goes to /dev/null so the watchdog never holds the caller's tee pipe open.
+  # Discard watchdog output so it cannot keep the batch log open.
   (
     nap=""
     trap '[[ -z "$nap" ]] || kill "$nap" 2>/dev/null; exit 0' TERM
@@ -174,11 +174,14 @@ run_test_once() {
     timeout --signal=TERM --kill-after="${BATCH_KILL_GRACE_SECONDS}s" \
       "${BATCH_TIMEOUT_SECONDS}s" \
       "$BUN_BIN" test --isolate ${PARALLEL_ARG:+"$PARALLEL_ARG"} --timeout 60000 "${files[@]}" 2>&1 | tee "$log_file"
+    status="${PIPESTATUS[0]}"
   else
+    # Keep this function out of a pipeline subshell; fallback output is buffered until return.
     run_with_batch_deadline "$BATCH_TIMEOUT_SECONDS" "$BATCH_KILL_GRACE_SECONDS" \
-      "$BUN_BIN" test --isolate ${PARALLEL_ARG:+"$PARALLEL_ARG"} --timeout 60000 "${files[@]}" 2>&1 | tee "$log_file"
+      "$BUN_BIN" test --isolate ${PARALLEL_ARG:+"$PARALLEL_ARG"} --timeout 60000 "${files[@]}" >"$log_file" 2>&1
+    status="$?"
+    cat "$log_file"
   fi
-  status="${PIPESTATUS[0]}"
   set -e
 
   echo "::endgroup::"

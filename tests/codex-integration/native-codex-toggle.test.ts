@@ -17,6 +17,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { handleManagementAPI } from "../../src/server/management-api";
+import type { CodexSyncResult } from "../../src/codex/sync";
 import type { ManagementApiDeps } from "../../src/server/management/context";
 import type { OcxConfig } from "../../src/types";
 import { removeTreeWithRetry } from "../helpers/remove-tree";
@@ -46,6 +47,21 @@ function testDeps(overrides: Partial<ManagementApiDeps> = {}): ManagementApiDeps
     fetchAllModels: async () => [] as never,
     ...overrides,
   } as ManagementApiDeps;
+}
+
+function codexSyncResult(status: CodexSyncResult["status"]): CodexSyncResult {
+  return {
+    status,
+    ok: status !== "refused",
+    ...(status === "skipped" ? { skippedReason: "hub-gated" as const } : {}),
+    ...(status === "refused" ? { authority: "service-home" as const } : {}),
+    added: 0,
+    catalogPath: null,
+    catalogExists: false,
+    catalogWritten: false,
+    cacheSynced: false,
+    message: "fixture result",
+  };
 }
 
 function dispatch(config: OcxConfig, path: string, init?: RequestInit, deps: ManagementApiDeps = testDeps()) {
@@ -159,7 +175,9 @@ describe("turning Codex off", () => {
   test("the status read follows an off-then-on round trip against the same stale server config", async () => {
     const serverConfig = baseConfig();
     await put(serverConfig, { enabled: false });
-    await put(serverConfig, { enabled: true });
+    await put(serverConfig, { enabled: true }, testDeps({
+      syncModelsToCodex: async () => codexSyncResult("applied"),
+    }));
     expect(persistedCodexIntent()).not.toBe(false);
 
     const response = await dispatch(serverConfig, "/api/native-integrations");
@@ -186,15 +204,32 @@ describe("turning Codex off", () => {
   });
 
   test("an enable that did not apply stays absent on the next status read", async () => {
-    // A hub does not rewrite its own Codex config, so the enable is saved but skipped.
+    // Model the sync layer's hub skip without consulting this Mac's live launchd state.
     writeFileSync(join(fixtureRoot, "config.json"), JSON.stringify({ ...baseConfig(), runtimeRole: "hub" }, null, 2));
     const serverConfig = { ...baseConfig(), runtimeRole: "hub" } as OcxConfig;
-    const enabled = await put(serverConfig, { enabled: true });
+    const enabled = await put(serverConfig, { enabled: true }, testDeps({
+      syncModelsToCodex: async () => codexSyncResult("skipped"),
+    }));
     expect(enabled.body).toMatchObject({ state: "absent", desiredEnabled: true, reason: "apply_incomplete" });
 
     const response = await dispatch(serverConfig, "/api/native-integrations");
     const body = await response!.json() as { clients: { clientId: string; state: string; desiredEnabled: boolean }[] };
     expect(body.clients.find(client => client.clientId === "codex")).toMatchObject({ state: "absent", desiredEnabled: true });
+  });
+
+  test("a service-home refusal stays absent on the next status read", async () => {
+    const serverConfig = baseConfig();
+    const enabled = await put(serverConfig, { enabled: true }, testDeps({
+      syncModelsToCodex: async () => codexSyncResult("refused"),
+    }));
+    expect(enabled.body).toMatchObject({ state: "absent", desiredEnabled: true, reason: "apply_incomplete" });
+
+    const response = await dispatch(serverConfig, "/api/native-integrations");
+    const body = await response!.json() as { clients: { clientId: string; state: string; desiredEnabled: boolean }[] };
+    expect(body.clients.find(client => client.clientId === "codex")).toMatchObject({
+      state: "absent",
+      desiredEnabled: true,
+    });
   });
 
   test("without a config file the status read keeps the request's in-memory intent", async () => {
@@ -256,7 +291,9 @@ describe("turning Codex back on", () => {
     await put(baseConfig(), { enabled: false });
     expect(persistedCodexIntent()).toBe(false);
 
-    const result = await put(baseConfig(), { enabled: true });
+    const result = await put(baseConfig(), { enabled: true }, testDeps({
+      syncModelsToCodex: async () => codexSyncResult("applied"),
+    }));
     expect(result.status).toBe(200);
     // Absence is ON, so an untouched config and a re-enabled one are identical.
     expect(persistedCodexIntent()).toBeUndefined();

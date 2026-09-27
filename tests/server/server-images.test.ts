@@ -4,7 +4,6 @@
  * instead of the /v1/* JSON-404 guard.
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync} from "node:fs";
 import { join } from "node:path";
 import { saveCodexAccountCredential } from "../../src/codex/account-store";
 import { clearAccountNeedsReauth, clearAccountQuota } from "../../src/codex/auth-api";
@@ -20,20 +19,17 @@ import type { OcxConfig } from "../../src/types";
 import { ANTIGRAVITY_REQUEST_UA } from "../../src/adapters/google-antigravity-wire";
 import { fakeChatGptJwt } from "../helpers/fake-chatgpt-jwt";
 import { installIsolatedCodexHome, type IsolatedCodexHome } from "../helpers/isolated-codex-home";
-import { removeTreeWithRetry } from "../helpers/remove-tree";
+import { createTempHome } from "../helpers/temp-home";
 
 const previousApiToken = process.env.OPENCODEX_API_AUTH_TOKEN;
-const previousOpencodexHome = process.env.OPENCODEX_HOME;
 const previousImagesApiKey = process.env.OPENCODEX_TEST_IMAGES_API_KEY;
 const originalFetch = globalThis.fetch;
-const TEST_DIR = join(import.meta.dir, ".tmp-server-images-test");
+let testHome: ReturnType<typeof createTempHome> | null = null;
 let isolatedCodexHome: IsolatedCodexHome | null = null;
 const DIRECT_CHATGPT_TOKEN = fakeChatGptJwt({ chatgpt_account_id: "acct-123" });
 
 beforeEach(() => {
-  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
-  mkdirSync(TEST_DIR, { recursive: true });
-  process.env.OPENCODEX_HOME = TEST_DIR;
+  testHome = createTempHome("ocx-server-images-");
   delete process.env.OPENCODEX_API_AUTH_TOKEN;
   process.env.OPENCODEX_TEST_IMAGES_API_KEY = "custom-images-key";
   isolatedCodexHome = installIsolatedCodexHome("ocx-server-images-codex-");
@@ -49,8 +45,6 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   if (previousApiToken === undefined) delete process.env.OPENCODEX_API_AUTH_TOKEN;
   else process.env.OPENCODEX_API_AUTH_TOKEN = previousApiToken;
-  if (previousOpencodexHome === undefined) delete process.env.OPENCODEX_HOME;
-  else process.env.OPENCODEX_HOME = previousOpencodexHome;
   if (previousImagesApiKey === undefined) delete process.env.OPENCODEX_TEST_IMAGES_API_KEY;
   else process.env.OPENCODEX_TEST_IMAGES_API_KEY = previousImagesApiKey;
   isolatedCodexHome?.restore();
@@ -59,7 +53,8 @@ afterEach(() => {
   clearThreadAccountMap();
   clearAccountNeedsReauth("pool-a");
   clearAccountQuota();
-  if (existsSync(TEST_DIR)) removeTreeWithRetry(TEST_DIR);
+  testHome?.remove();
+  testHome = null;
 });
 
 interface CapturedRequest {

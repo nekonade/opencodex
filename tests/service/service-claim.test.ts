@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, statSync } from "node:fs";
 import { parseClaimArgs, runServiceClaim, CLAIM_SCHEMA } from "../../src/service/claim";
-import { ServiceOwnershipSubjectMismatchError, serviceStatePath, serviceStatePaths } from "../../src/service/state";
+import { ServiceOwnershipSubjectMismatchError, serviceStatePath } from "../../src/service/state";
 import type { ServiceOwnershipSubject } from "../../src/service/state";
 import { createTempHome } from "../helpers/temp-home";
 
@@ -147,7 +147,7 @@ describe("runServiceClaim", () => {
     const previousUserProfile = process.env.USERPROFILE;
     if (process.platform === "win32") process.env.USERPROFILE = home.root;
     try {
-      expect(serviceStatePaths().every(path => path.startsWith(home.root))).toBe(true);
+      expect(serviceStatePath()).toBe(home.path("service-state.json"));
       mkdirSync(serviceStatePath());
       const lines: string[] = [];
       const code = await runServiceClaim([...VALID, "--json"], {
