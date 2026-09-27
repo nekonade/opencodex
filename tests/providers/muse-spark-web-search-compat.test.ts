@@ -394,4 +394,49 @@ describe("#2617/#3378 Muse Spark web_search compatibility", () => {
     expect(Object.hasOwn(rewritten.tools[0]!, "search_content_types")).toBe(false);
     expect(Object.hasOwn(rewritten.tools[0]!, "indexed_web_access")).toBe(false);
   });
+
+  test("direct Meta remains destination-scoped for an arbitrary model id", () => {
+    const body = buildForProvider(META_PROVIDER, "gpt-5.6-luna", { tools: [webSearchTool()] });
+    const tool = toolsOf(body)[0]!;
+    expect(Object.hasOwn(tool, "search_content_types")).toBe(false);
+    expect(Object.hasOwn(tool, "indexed_web_access")).toBe(false);
+  });
+
+  test("Zen destinations trim and case-fold Contributor model ids", () => {
+    const providers = [ZEN_PROVIDER, ZEN_GO_PROVIDER];
+    const modelIds = ["  muse-spark-1.3-contributor  ", "MUSE-SPARK-1.2-CONTRIBUTOR-FREE"];
+
+    for (const provider of providers) {
+      for (const modelId of modelIds) {
+        const body = buildForProvider(provider, modelId, { tools: [webSearchTool()] });
+        const tool = toolsOf(body)[0]!;
+        expect(Object.hasOwn(tool, "search_content_types")).toBe(false);
+        expect(Object.hasOwn(tool, "indexed_web_access")).toBe(false);
+      }
+    }
+  });
+
+  test("malformed bodies and tool containers are returned unchanged", () => {
+    const malformedBodies: unknown[] = [null, undefined, "body", 1, false, []];
+    for (const body of malformedBodies) {
+      expect(
+        stripMuseSparkUnsupportedWebSearchFields(body, "muse-spark-1.3-contributor", "https://api.meta.ai/v1/responses"),
+      ).toBe(body);
+    }
+
+    const malformedContainers = [
+      { tools: null },
+      { tools: { type: "web_search", ...webSearchTool() } },
+      { input: { type: "additional_tools", tools: [webSearchTool()] } },
+      {
+        tools: [null, "invalid tool", { ...webSearchTool(), type: "web_search_preview" }],
+        input: [null, "invalid item", { type: "additional_tools", tools: "not-an-array" }],
+      },
+    ];
+    for (const body of malformedContainers) {
+      expect(
+        stripMuseSparkUnsupportedWebSearchFields(body, "muse-spark-1.3-contributor", "https://api.meta.ai/v1/responses"),
+      ).toBe(body);
+    }
+  });
 });
