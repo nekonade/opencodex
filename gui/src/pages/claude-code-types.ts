@@ -1,4 +1,4 @@
-import type { SidecarOverride } from "./claude-manual-env";
+import type { AnthropicPoolOptions, SidecarOverride } from "./claude-manual-env";
 
 export interface MapRow {
   id: string;
@@ -29,6 +29,16 @@ export function newClientId(): string {
 
 export interface ClaudeCodeState {
   enabled: boolean;
+  cliFirstParty: boolean;
+  cliFirstPartyApplied: boolean;
+  desktopFirstParty: boolean;
+  interceptReason?: string | null;
+  pickerReason?: string | null;
+  pickerFailurePort?: number;
+  interceptFailurePort?: number;
+  interceptRunning: boolean;
+  interceptEligible: boolean;
+  sharedProxy: "none" | "live" | "stopped" | "disabled" | "broken" | "foreign" | "local" | "unknown";
   /** Three-state intent. "auto" resolves from detected Claude auth on every launch. */
   authMode: "auto" | "subscription" | "proxy";
   /** Resolved: does the opencodex dummy marker get injected. Not a native-auth claim. */
@@ -47,18 +57,38 @@ export interface ClaudeCodeState {
   maxContextTokens: number | null;
   autoContext: boolean;
   autoCompactWindow: number | null;
+  /** "1m" is the default; "200k" opts Claude surfaces out of automatic 1M (devlog 261009 030). */
+  contextAccounting: "1m" | "200k";
+  /**
+   * Accounting the server used when it built `effectiveModelEnv`. A draft can change
+   * `contextAccounting` before the next GET; the manual snippet must not mix the two.
+   */
+  servedContextAccounting?: "1m" | "200k";
+  /** Configured main slot. The manual snippet uses it to tell an explicit `[1m]` from an automatic one. */
+  model?: string;
   injectAgents: boolean;
   smallFastModel: string;
-  tierModels?: { haiku?: string };
+  tierModels?: { opus?: string; sonnet?: string; haiku?: string; fable?: string };
   effectiveModelEnv: Record<string, string>;
   available: string[];
   aliases: { id: string; display_name: string }[];
   webSearchSidecar?: SidecarOverride;
   visionSidecar?: SidecarOverride;
+  sidecarPools?: { webSearchSidecar: AnthropicPoolOptions; visionSidecar: AnthropicPoolOptions };
   port: number;
 }
 
 /** Compact auto-summarize window labels (350k / 1M). Uses Intl for the million suffix. */
+/**
+ * Mirror of AUTO_COMPACT_WINDOW_DEFAULT in src/claude/context-windows.ts.
+ *
+ * The GUI cannot import from src/, so this is a hand-kept copy. It exists as a named
+ * constant rather than a literal because the previous default lived inline in a ladder, a
+ * comment, a manual-env fallback, and nine translated labels — and a default change left
+ * every one of them saying 350k while the runtime injected something else.
+ */
+export const AUTO_COMPACT_WINDOW_DEFAULT = 829_800;
+
 export function formatCompactWindow(value: number, locale = "en"): string {
   if (value >= 1_000_000) {
     const millions = value / 1_000_000;
@@ -75,4 +105,12 @@ export function formatCompactWindow(value: number, locale = "en"): string {
     return `${Math.round(value / 1_000)}k`;
   }
   return `${Math.round(value / 1_000)}k`;
+}
+
+/**
+ * The stored policy as the page edits it. A state cached by an older proxy, or read from one,
+ * has no field and is the "1m" default; anything but "200k" reads the same way.
+ */
+export function normalizeContextAccounting(value: unknown): "1m" | "200k" {
+  return value === "200k" ? "200k" : "1m";
 }

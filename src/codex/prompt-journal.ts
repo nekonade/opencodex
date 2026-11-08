@@ -1,3 +1,5 @@
+import { configWriteLockFailureMessage, withConfigWriteLockHeld, publishConfigWrite, watchConfigWriteTargets, publishConfigWriteTarget, type LockHandle } from "./config-write-lock";
+import { codexHomeIsAbsent } from "./codex-home-owner";
 /**
  * prompt-journal.ts — the write transaction behind the prompt-layer surface.
  *
@@ -19,10 +21,12 @@
  * concrete: crash after writing config.toml, user or Codex then edits it,
  * recovery sees a mismatch and overwrites their work with a stale image.
  */
-import { existsSync, mkdirSync, openSync, closeSync, fsyncSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import type { AtomicWriteHooks } from "../config/atomic-write";
+import { existsSync, mkdirSync, openSync, closeSync, fsyncSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { forgetEphemeralSecretPath, hardenSecretPath, windowsSecretAclApplies } from "../lib/windows-secret-acl";
+import { renameAtomicFile } from "../lib/windows-atomic-replace";
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
@@ -67,7 +71,7 @@ function fsyncDir(path: string): void {
 }
 
 /** Write at mode 0600 from creation — a later chmod leaves a readable window. */
-export function durableWrite(path: string, content: string): void {
+export function durableWrite(path: string, content: string, hooks: AtomicWriteHooks = {}): void {
   const tmp = `${path}.ocx.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   let fd: number | undefined;
   try {
@@ -79,7 +83,12 @@ export function durableWrite(path: string, content: string): void {
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    renameSync(tmp, path);
+    // Windows can refuse the replace with EBUSY/EPERM/EACCES while a scanner
+    // still holds the target; the shared helper retries that briefly. Losing
+    // this publish breaks journal restore, so it should not fail on a blink.
+    hooks.beforeRename?.(tmp, path);
+    renameAtomicFile(tmp, path, undefined, "prompt-journal", hooks);
+    hooks.afterRename?.(path);
     // The temp is renamed away: proven absent — release its ACL memos.
     forgetEphemeralSecretPath(tmp);
     fsyncDir(path);
@@ -104,9 +113,11 @@ export function durableWrite(path: string, content: string): void {
   }
 }
 
-export function durableDelete(path: string): void {
+export function durableDelete(path: string, hooks: AtomicWriteHooks = {}): void {
   try {
+    hooks.validateBeforeRename?.(path);
     if (existsSync(path)) unlinkSync(path);
+    hooks.afterRename?.(path);
     fsyncDir(path);
   } catch (error) {
     // Only absence is the state we wanted; every other deletion failure must
@@ -208,7 +219,7 @@ export function classify(actual: string | null, pre: string, post: string): Targ
 
 export type RecoveryOutcome =
   | { ok: true; action: "none" | "committed" | "rolled-back" }
-  | { ok: false; error: "recovery_required"; detail: string };
+  | { ok: false; error: "recovery_required" | "unsafe"; detail: string };
 
 export interface RecoveryTargets {
   configPath: string;
@@ -243,7 +254,11 @@ export function sameRecoveryPath(
 export function recoverIfNeeded(
   journalPath: string,
   expectedTargets: RecoveryTargets,
+  heldConfigWriteLock?: LockHandle,
 ): RecoveryOutcome {
+  if (codexHomeIsAbsent(dirname(expectedTargets.configPath)) && !existsSync(journalPath)) return { ok: true, action: "none" };
+  const locked = withConfigWriteLockHeld(expectedTargets.configPath, heldConfigWriteLock, held => {
+  watchConfigWriteTargets(held, [journalPath, expectedTargets.storePath]);
   const raw = readOrNull(journalPath);
   if (raw === null) return { ok: true, action: "none" };
 
@@ -281,7 +296,7 @@ export function recoverIfNeeded(
 
   if (config === "post" && store === "post") {
     try {
-      durableDelete(journalPath);
+      publishConfigWriteTarget(expectedTargets.configPath, held, journalPath, (destination, hooks) => durableDelete(destination, hooks));
     } catch (error) {
       return {
         ok: false,
@@ -303,7 +318,7 @@ export function recoverIfNeeded(
       };
     }
     try {
-      restore(expectedTargets.configPath, record.preConfigBytes);
+      publishConfigWrite(expectedTargets.configPath, held, (destination, hooks) => restore(destination, record.preConfigBytes, expectingImage(hooks, record.postConfig)));
     } catch (error) {
       return {
         ok: false,
@@ -321,7 +336,7 @@ export function recoverIfNeeded(
       };
     }
     try {
-      restore(expectedTargets.storePath, record.preStoreBytes);
+      publishConfigWriteTarget(expectedTargets.configPath, held, expectedTargets.storePath, (destination, hooks) => restore(destination, record.preStoreBytes, expectingImage(hooks, record.postStore)));
     } catch (error) {
       return {
         ok: false,
@@ -331,7 +346,7 @@ export function recoverIfNeeded(
     }
   }
   try {
-    durableDelete(journalPath);
+    publishConfigWriteTarget(expectedTargets.configPath, held, journalPath, (destination, hooks) => durableDelete(destination, hooks));
   } catch (error) {
     return {
       ok: false,
@@ -339,10 +354,30 @@ export function recoverIfNeeded(
       detail: `rollback restored but the journal could not be removed: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  return { ok: true, action: "rolled-back" };
+  return { ok: true, action: "rolled-back" } as RecoveryOutcome;
+  });
+  return locked.ok ? locked.value as RecoveryOutcome : { ok: false, error: locked.error === "unsafe" ? "unsafe" : "recovery_required", detail: configWriteLockFailureMessage(locked) };
 }
 
-function restore(path: string, bytes: string | null): void {
-  if (bytes === null) durableDelete(path);
-  else durableWrite(path, bytes);
+function restore(path: string, bytes: string | null, hooks: AtomicWriteHooks): void {
+  if (bytes === null) durableDelete(path, hooks);
+  else durableWrite(path, bytes, hooks);
+}
+
+/**
+ * Bind a write to the image the caller classified. The rename retry hooks check
+ * path and inode identity only; an in-place edit by another process during a
+ * Windows sharing-violation retry keeps the inode, so without this re-read a
+ * later attempt would replace newer bytes. Checked before every attempt.
+ */
+export function expectingImage(hooks: AtomicWriteHooks, expectedHash: string): AtomicWriteHooks {
+  return {
+    ...hooks,
+    validateBeforeRename: (targetPath: string) => {
+      hooks.validateBeforeRename?.(targetPath);
+      if (hashBytes(readOrNull(targetPath)) !== expectedHash) {
+        throw new Error(targetPath + " changed during the write; refusing to overwrite it. Files and recovery evidence were preserved.");
+      }
+    },
+  };
 }

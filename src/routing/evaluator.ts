@@ -21,7 +21,7 @@ import {
   type Unknownable,
 } from "./trace";
 import { getRoutingProfile, policyModelId, type NormalizedRoutingProfile } from "./profile";
-import { healthScore } from "./health";
+import { healthScore, latencyScoreFromEvidence } from "./health";
 import { quotaScore } from "./quota";
 import { costScore } from "./cost";
 import { evaluateCompatibilityForCandidate } from "./compatibility/policy";
@@ -54,6 +54,8 @@ export interface PolicyCandidateEvidence {
   accountRef?: string;
   /** Codex pool account id (provider "openai"); used to derive account-scoped quota evidence. */
   codexAccountId?: string;
+  /** A failed effective-transport resolution excludes the candidate under every unknown policy. */
+  routeResolutionFailed?: boolean;
   capability?: RouteCapabilityEvidence;
   health?: RouteHealthEvidence;
   quota?: RouteQuotaEvidence;
@@ -278,6 +280,8 @@ export function evaluatePolicyProfile(
       ...requestRequirementFor(requestEvidence, evidence.capability),
     ];
     const exclusions: RouteExclusionReason[] = [];
+    const routeUnavailable = evidence.routeResolutionFailed === true;
+    if (routeUnavailable) exclusions.push({ code: "route-unavailable" });
     const bad = unsatisfiedOrUnknown(requirements);
     for (const requirement of bad) {
       if (requirement.outcome === "unsatisfied") {
@@ -310,7 +314,7 @@ export function evaluatePolicyProfile(
     if (unknownCostBlocked) {
       exclusions.push({ code: "cost-limit-unknown", detail: "maxEstimatedCostUsd" });
     }
-    let eligible = !unsatisfied && !excludedByUnknown && !overCostLimit && !unknownCostBlocked;
+    let eligible = !routeUnavailable && !unsatisfied && !excludedByUnknown && !overCostLimit && !unknownCostBlocked;
 
     // Trace/dry-run copy only: report the profile cap that was applied and the
     // operator-visible outcome. Do not feed this copy into costScore() — that
@@ -398,10 +402,16 @@ export function evaluatePolicyProfile(
     const healthWeight = profile.optimize.health;
     const quotaWeight = profile.optimize.quota;
     const costWeight = profile.optimize.cost;
+    // `optimize.latency` was normalized into the weight sum but never spent, so whatever
+    // was allocated to it silently became configuredPriority -- i.e. declaration order.
+    // Spend it on the same p50-derived score the health composite already uses.
+    const latencyWeight = profile.optimize.latency;
+    const latencyValue = latencyWeight > 0 ? latencyScoreFromEvidence(health) : null;
     const spentHealth = healthValue !== null ? healthWeight : 0;
     const spentQuota = quotaValue !== null ? quotaWeight : 0;
     const spentCost = costValue !== null ? costWeight : 0;
-    const priorityWeight = Math.max(0, 1 - spentHealth - spentQuota - spentCost);
+    const spentLatency = latencyValue !== null ? latencyWeight : 0;
+    const priorityWeight = Math.max(0, 1 - spentHealth - spentQuota - spentCost - spentLatency);
     const components: RouteScoreEvidence["components"] = { configuredPriority: priorityScore };
     let total = priorityWeight * priorityScore;
     if (healthWeight > 0 && healthValue !== null) {
@@ -415,6 +425,10 @@ export function evaluatePolicyProfile(
     if (costWeight > 0 && costValue !== null) {
       total += costWeight * costValue;
       components.cost = costValue;
+    }
+    if (latencyWeight > 0 && latencyValue !== null) {
+      total += latencyWeight * latencyValue;
+      components.latency = latencyValue;
     }
     if (compatibilityValue !== null) {
       // Compatibility is a penalty-only dimension. A penalized candidate loses

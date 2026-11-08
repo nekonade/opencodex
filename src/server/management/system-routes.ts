@@ -15,8 +15,9 @@
  * further: it is the proxy's previous_response_id continuation store, so a
  * growing responseState.totalBytes under rising observed memory points at
  * conversation retention rather than the runtime allocator. Spill counts,
- * payload-byte totals, tombstones, and failure counters remain finite scalars;
- * response ids, filenames, digests, paths, and payload content never leave the owner.
+ * payload-byte totals, tombstones, failure counters, fixed health/error enums,
+ * and event timestamps remain finite scalars; response ids, raw errors,
+ * filenames, digests, paths, and payload content never leave the owner.
  *
  * `activeTurnCount` / `isDraining` are scalar lifecycle counters for the
  * dashboard drain-and-restart confirm UX — never request bodies or IDs.
@@ -25,21 +26,58 @@ import { selectEagerPath } from "../../lib/bun-stream-caps";
 import { reportedBunRuntimeSource } from "../../lib/bun-runtime";
 import { getActiveTurnCount, isDraining } from "../lifecycle";
 import { getActiveMemoryWatchdog, observedMemoryCounter } from "../memory-watchdog";
-import { responseStateMetrics } from "../../responses/state";
+import { inspectResponseSpillStorage, responseStateMetrics, type ResponseSpillDirInspection } from "../../responses/state";
 import { appOwnedBytesSnapshot } from "../../lib/app-owned-memory";
+import { readWindowsReplaceRetryCounters } from "../../lib/windows-atomic-replace";
 import {
+  MEMORY_DRAIN_RESTART_MS,
   SYSTEM_RESTART_EXPECTED_PID_HEADER,
   parseExpectedSystemRestartPid,
 } from "../../lib/system-restart-contract";
+import {
+  CODEX_APP_SERVER_STATE_PATH,
+  CODEX_RESTART_PATH,
+} from "../../lib/codex-restart-contract";
 import { jsonResponse } from "../auth-cors";
 import { getInspectionCounters } from "../relay";
+import { spendLedgerDiagnosticsSnapshot } from "../../lib/spend-reservation-ledger";
+import type {
+  performCodexRestart,
+  readCodexAppServerState,
+} from "../../codex/app-server-restart-service";
 import type { ManagementContext } from "./context";
 import { acceptSystemRestart } from "./system-restart";
+import { readOptionalManagementJsonBody, rethrowManagementBodyTooLarge } from "./body";
 
 const ENDPOINT_SAMPLE_LIMIT = 60;
+// The spill report reads the snapshot and walks the spill directory synchronously,
+// so a polled memory endpoint reuses one result per window instead of rescanning.
+const RESPONSE_SPILL_REPORT_TTL_MS = 30_000;
+let responseSpillReport: { at: number; value: ResponseSpillDirInspection } | null = null;
+
+function cachedResponseSpillReport(): ResponseSpillDirInspection {
+  const now = Date.now();
+  if (!responseSpillReport || now - responseSpillReport.at >= RESPONSE_SPILL_REPORT_TTL_MS) {
+    responseSpillReport = { at: now, value: inspectResponseSpillStorage() };
+  }
+  return responseSpillReport.value;
+}
 
 export async function handleSystemRoutes(ctx: ManagementContext): Promise<Response | null> {
-  const { req, url, config } = ctx;
+  const { req, url, config, version } = ctx;
+  if (url.pathname === "/api/system/health" && req.method === "GET") {
+    // Authenticated management counterpart to /healthz. Remote Hub deliberately keeps the
+    // unauthenticated liveness route off its management ingress, while the connected dashboard
+    // still needs bounded process identity and PID replacement evidence (#3158).
+    return jsonResponse({
+      status: "ok",
+      service: "opencodex",
+      version,
+      uptime: process.uptime(),
+      pid: process.pid,
+      spendLedger: spendLedgerDiagnosticsSnapshot(),
+    });
+  }
   if (url.pathname === "/api/system/memory" && req.method === "GET") {
     const usage = process.memoryUsage();
     let jscHeap: { heapSize: number; heapCapacity: number; objectCount: number } | null = null;
@@ -97,6 +135,11 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
 	      observedMetric: observed.observedMetric,
 	      jscHeap,
       responseState: responseStateMetrics(),
+      // Dry-run spill-directory counters: owned vs orphan-candidate bytes, same
+      // predicate the startup reclaim uses. Sibling of responseState, not a field
+      // in it — that block's key count is pinned. Still scalar-only. Cached for
+      // RESPONSE_SPILL_REPORT_TTL_MS.
+      responseSpill: cachedResponseSpillReport(),
       appOwnedBytes: appOwnedBytesSnapshot(),
       inspectionCounters: getInspectionCounters(),
       streamMode,
@@ -107,6 +150,20 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
     });
   }
 
+  /**
+   * Windows atomic-replace retry counters.
+   *
+   * A sibling route rather than a field on /api/system/memory: that payload is
+   * memory-shaped, and appending unrelated filesystem counters to it makes both
+   * harder to consume.
+   *
+   * Keys are `publisher:CODE` where publisher is a closed union
+   * (ReplacePublisher) and never a path — a path could carry a username. The
+   * type is what enforces that; a text scan cannot see a runtime value.
+   */
+  if (url.pathname === "/api/system/windows-replace-retries" && req.method === "GET") {
+    return jsonResponse({ counters: readWindowsReplaceRetryCounters() });
+  }
   if (url.pathname === "/api/system/restart" && req.method === "POST") {
     const expectedPid = parseExpectedSystemRestartPid(
       req.headers.get(SYSTEM_RESTART_EXPECTED_PID_HEADER),
@@ -124,8 +181,28 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
       }, 409, req, config);
     }
 
-    // Longer informed drain than /api/stop; does not tear down Codex/Grok injection.
-    const result = acceptSystemRestart();
+    let body: unknown;
+    try { body = await readOptionalManagementJsonBody(req); }
+    catch (error) {
+      rethrowManagementBodyTooLarge(error);
+      return jsonResponse({ success: false, error: "Invalid restart JSON body." }, 400, req, config);
+    }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return jsonResponse({ success: false, error: "Invalid restart JSON body." }, 400, req, config);
+    }
+    const drainGraceMs = (body as Record<string, unknown>).drainGraceMs;
+    if (drainGraceMs !== undefined && (
+      typeof drainGraceMs !== "number" || !Number.isSafeInteger(drainGraceMs)
+      || drainGraceMs < 1 || drainGraceMs > MEMORY_DRAIN_RESTART_MS
+    )) {
+      return jsonResponse({ success: false, error: "drainGraceMs must be an integer from 1 to 60000." }, 400, req, config);
+    }
+    // The process capability signs the restart target, not this new body option.
+    if (drainGraceMs !== undefined && ctx.principal === "system-restart-capability") {
+      return jsonResponse({ success: false, error: "Short grace requires management authentication." }, 403, req, config);
+    }
+    // Omission retains the informed 60s drain; only an explicit API request shortens it.
+    const result = acceptSystemRestart(undefined, {}, { drainGraceMs });
     return jsonResponse({
       success: true,
       message: result.alreadyDraining
@@ -135,6 +212,36 @@ export async function handleSystemRoutes(ctx: ManagementContext): Promise<Respon
       drainTimeoutMs: result.drainTimeoutMs,
       alreadyDraining: result.alreadyDraining,
     }, 202, req, config);
+  }
+
+  if (
+    (url.pathname === CODEX_APP_SERVER_STATE_PATH && req.method === "GET")
+    || (url.pathname === CODEX_RESTART_PATH && req.method === "POST")
+  ) {
+    // Resolved inside the path check, not at the top of this function: every
+    // /api/system/* request runs through here, and an unconditional import would
+    // pull the platform process-enumeration helpers into requests that never
+    // touch them.
+    // An explicit branch rather than `??`: the seam is an optional property, and
+    // narrowing through a nullish default keeps its `undefined` in the union.
+    let service: {
+      readState: typeof readCodexAppServerState;
+      performRestart: typeof performCodexRestart;
+    };
+    const injected = ctx.deps.codexRestartService;
+    if (injected) {
+      service = injected;
+    } else {
+      const module = await import("../../codex/app-server-restart-service");
+      service = {
+        readState: module.readCodexAppServerState,
+        performRestart: module.performCodexRestart,
+      };
+    }
+    if (req.method === "GET") {
+      return jsonResponse(await service.readState(), 200, req, config);
+    }
+    return jsonResponse(await service.performRestart(), 200, req, config);
   }
 
   return null;

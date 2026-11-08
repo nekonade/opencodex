@@ -112,7 +112,18 @@ test("Models page combines final visibility, atomic actions, discovery status, a
   });
   testWindow.localStorage.setItem("ocx-models-collapsed:v2", JSON.stringify([]));
   const provider = "fallback-provider";
-  const ids = ["claude-opus", "claude-sonnet", "gemini-pro", "gemini-flash", "gpt-oss"];
+  // Provider model IDs are arbitrary strings. Prototype property names must behave like normal
+  // IDs rather than reading inherited values from the context-window draft dictionary.
+  const ids = [
+    "__proto__",
+    "constructor",
+    "toString",
+    "claude-opus",
+    "claude-sonnet",
+    "gemini-pro",
+    "gemini-flash",
+    "gpt-oss",
+  ];
   let selected = ["gemini-pro", "gemini-flash"];
   const disabled = new Set(["gpt-oss"]);
   const visibilityBodies: Array<{ scope: string; targets: Array<{ id: string }>; enabled: boolean }> = [];
@@ -130,10 +141,11 @@ test("Models page combines final visibility, atomic actions, discovery status, a
   };
   let failNext = false;
   let failCatalog = false;
+  let initialSelectionPending = false;
   let modelFetches = 0;
   let resolveModels!: (response: Response) => void;
   const firstModels = new Promise<Response>(resolve => { resolveModels = resolve; });
-  const rows = () => ids.map(id => ({ provider, id, namespaced: `${provider}/${id}`, disabled: disabled.has(id) }));
+  const rows = () => ids.map(id => ({ provider, id, namespaced: `${provider}/${id}`, disabled: initialSelectionPending || disabled.has(id), ...(initialSelectionPending ? { initialSelectionPending: true } : {}) }));
   testWindow.sessionStorage.setItem("ocx.models.catalog.v1:http://localhost", JSON.stringify({
     models: rows(),
     providers: [{ name: provider, liveModels: true, models: ids }],
@@ -215,16 +227,18 @@ test("Models page combines final visibility, atomic actions, discovery status, a
 
     const switchFor = (id: string) => container.querySelector<HTMLButtonElement>(`button[aria-label="${provider}/${id}"]`)!;
     const buttonText = (text: string) => [...container.querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === text)!;
-    expect(container.textContent).toContain("2/5 visible");
+    expect(container.textContent).toContain("2/8 visible");
     expect(switchFor("gemini-pro").getAttribute("aria-pressed")).toBe("true");
     expect(switchFor("claude-sonnet").getAttribute("aria-pressed")).toBe("false");
     expect(container.querySelector(".badge.badge-amber")?.textContent).toContain("Discovery failed");
     expect(container.textContent).not.toContain("Not selected");
 
-    await act(async () => buttonText("Context windows").click());
-    const contextDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const contextDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     const contextInputs = contextDialog.querySelectorAll<HTMLInputElement>("input");
-    expect([...contextInputs].map(input => input.value)).toEqual(["256000", "64000"]);
+    // The picker sorts model IDs, so "__proto__" is selected first. Its field must render an
+    // empty draft, not the inherited Object.prototype member a plain map read would return.
+    expect([...contextInputs].map(input => input.value)).toEqual(["256000", ""]);
     const setValue = Object.getOwnPropertyDescriptor(
       testWindow.HTMLInputElement.prototype,
       "value",
@@ -232,7 +246,7 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     await act(async () => {
       setValue.call(contextInputs[0]!, "350000");
       contextInputs[0]!.dispatchEvent(new testWindow.Event("input", { bubbles: true }));
-      setValue.call(contextInputs[1]!, "100000");
+      setValue.call(contextInputs[1]!, "90000");
       contextInputs[1]!.dispatchEvent(new testWindow.Event("input", { bubbles: true }));
     });
     const pickContextModel = async (modelId: string, dialog: HTMLElement = contextDialog) => {
@@ -243,6 +257,17 @@ test("Models page combines final visibility, atomic actions, discovery status, a
         .find(candidate => candidate.textContent === modelId)!;
       await act(async () => option.click());
     };
+    await pickContextModel("claude-opus");
+    expect(contextInputs[1]!.value).toBe("64000");
+    await act(async () => {
+      setValue.call(contextInputs[1]!, "100000");
+      contextInputs[1]!.dispatchEvent(new testWindow.Event("input", { bubbles: true }));
+    });
+    // Inherited members such as Object.prototype.toString must not leak into the draft field.
+    await pickContextModel("constructor");
+    expect(contextInputs[1]!.value).toBe("");
+    await pickContextModel("toString");
+    expect(contextInputs[1]!.value).toBe("");
     await pickContextModel("claude-sonnet");
     expect(contextInputs[1]!.value).toBe("");
     await act(async () => {
@@ -257,6 +282,9 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // or the user can neither see nor clear it.
     await pickContextModel("retired-model");
     expect(contextInputs[1]!.value).toBe("72000");
+    // The prototype-name draft is an own property, so it survives a picker round-trip.
+    await pickContextModel("__proto__");
+    expect(contextInputs[1]!.value).toBe("90000");
     await pickContextModel("claude-opus");
     const applyContext = [...contextDialog.querySelectorAll<HTMLButtonElement>("button")]
       .find(button => button.textContent === "Apply")!;
@@ -273,12 +301,19 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // model mid-modal must not make Apply revert it.
     expect(contextBodies.at(-1)).toEqual({
       contextWindow: 350_000,
-      modelContextWindows: { "claude-opus": 100_000, "claude-sonnet": 80_000 },
+      // Object.fromEntries defines "__proto__" as a real own property; a
+      // `{ "__proto__": n }` literal would silently skip it, which is exactly the
+      // defect under test.
+      modelContextWindows: Object.fromEntries([
+        ["__proto__", 90_000],
+        ["claude-opus", 100_000],
+        ["claude-sonnet", 80_000],
+      ]),
     });
-    expect(container.querySelector('[role="dialog"][aria-label="Context windows"]')).toBeNull();
+    expect(container.querySelector('[role="dialog"][aria-label="Custom windows"]')).toBeNull();
 
-    await act(async () => buttonText("Context windows").click());
-    const refreshFailureDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const refreshFailureDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     failCatalog = true;
     // Make an actual edit. Apply now compares against the values the modal opened with, so a
     // reopened-and-untouched dialog sends nothing — which would leave this case asserting the
@@ -296,15 +331,15 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     });
     expect(contextBodies).toHaveLength(2);
     expect(contextBodies.at(-1)).toEqual({ contextWindow: 360_000 });
-    expect(container.querySelector('[role="dialog"][aria-label="Context windows"]')).toBeNull();
+    expect(container.querySelector('[role="dialog"][aria-label="Custom windows"]')).toBeNull();
     expect(container.textContent).toContain("Context windows updated");
     failCatalog = false;
 
     // An edit that is typed and then restored is not a change — and neither is retyping the
     // same number in a different shape. Comparing raw text instead of parsed values would
     // treat "64,000" as an edit and stamp a stale number over whatever else moved.
-    await act(async () => buttonText("Context windows").click());
-    const revertDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const revertDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     const revertInput = revertDialog.querySelectorAll<HTMLInputElement>("input.input")[0]!;
     const openingValue = revertInput.value;
     await act(async () => {
@@ -320,10 +355,10 @@ test("Models page combines final visibility, atomic actions, discovery status, a
       await new Promise(resolve => testWindow.setTimeout(resolve, 0));
     });
     expect(contextBodies).toHaveLength(2);
-    expect(container.querySelector('[role="dialog"][aria-label="Context windows"]')).toBeNull();
+    expect(container.querySelector('[role="dialog"][aria-label="Custom windows"]')).toBeNull();
 
-    await act(async () => buttonText("Context windows").click());
-    const reformatDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const reformatDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     const reformatInput = reformatDialog.querySelectorAll<HTMLInputElement>("input.input")[0]!;
     const commaFormatted = reformatInput.value.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
     await act(async () => {
@@ -353,8 +388,8 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // The poll has to actually run: mutating the mock alone leaves React's `groups` on the
     // opening values, and then comparing drafts against LIVE state — the defect — would look
     // identical to comparing against the snapshot.
-    await act(async () => buttonText("Context windows").click());
-    const concurrentDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const concurrentDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     providerContextWindow = 300_000;
     providerModelContextWindows = { ...providerModelContextWindows, "claude-opus": 96_000 };
     await act(async () => { poll(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
@@ -379,8 +414,8 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // `groups` instead of the opening snapshot. The cases above cannot see that swap, because
     // in each of them the user's value genuinely differs from both. This one does — the user
     // touches a field and puts it back, while the server moves underneath.
-    await act(async () => buttonText("Context windows").click());
-    const staleDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const staleDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     const staleDefaultInput = staleDialog.querySelectorAll<HTMLInputElement>("input.input")[0]!;
     const staleOpeningDefault = staleDefaultInput.value;
     await act(async () => {
@@ -419,8 +454,8 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // anyone whose config was hand-edited before the safe-integer bound existed.
     providerContextWindow = 1e100;
     await act(async () => { poll(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
-    await act(async () => buttonText("Context windows").click());
-    const unsafeDefaultDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const unsafeDefaultDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     await pickContextModel("claude-sonnet", unsafeDefaultDialog);
     const unsafeSiblingInput = unsafeDefaultDialog.querySelectorAll<HTMLInputElement>("input.input")[1]!;
     await act(async () => {
@@ -438,8 +473,8 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // `Number.isInteger(1e100)` is true, and the server rejects it. Accepting it in the form
     // would turn a typo into a round-trip error instead of inline feedback.
     const patchesBeforeUnsafe = contextBodies.length;
-    await act(async () => buttonText("Context windows").click());
-    const unsafeDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Context windows"]')!;
+    await act(async () => buttonText("Custom windows").click());
+    const unsafeDialog = container.querySelector<HTMLElement>('[role="dialog"][aria-label="Custom windows"]')!;
     const unsafeInput = unsafeDialog.querySelectorAll<HTMLInputElement>("input.input")[0]!;
     await act(async () => {
       setValue.call(unsafeInput, "1e100");
@@ -454,7 +489,7 @@ test("Models page combines final visibility, atomic actions, discovery status, a
     // Relative, not absolute: an absolute count silently re-targets whenever a case is added
     // above, and the property under test is "this Apply wrote nothing".
     expect(contextBodies).toHaveLength(patchesBeforeUnsafe);
-    expect(container.querySelector('[role="dialog"][aria-label="Context windows"]')).not.toBeNull();
+    expect(container.querySelector('[role="dialog"][aria-label="Custom windows"]')).not.toBeNull();
     // The modal staying open is not the point — the user has to be TOLD why. Without this the
     // test passes on a silent no-op that looks identical to a hang.
     expect(unsafeDialog.textContent).toContain("Context windows must be positive whole numbers");
@@ -472,7 +507,7 @@ test("Models page combines final visibility, atomic actions, discovery status, a
 
     await act(async () => { switchFor("claude-sonnet").click(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
     expect(visibilityBodies.at(-1)).toMatchObject({ scope: "models", targets: [{ id: "claude-sonnet" }], enabled: true });
-    expect(container.textContent).toContain("3/5 visible");
+    expect(container.textContent).toContain("3/8 visible");
 
     failNext = true;
     await act(async () => { switchFor("claude-opus").click(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
@@ -481,16 +516,22 @@ test("Models page combines final visibility, atomic actions, discovery status, a
 
     await act(async () => { buttonText("All on").click(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
     expect(visibilityBodies.at(-1)).toMatchObject({ scope: "provider", enabled: true });
-    expect(container.textContent).toContain("5/5 visible");
+    expect(container.textContent).toContain("8/8 visible");
     await act(async () => { buttonText("All off").click(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
     expect(visibilityBodies.at(-1)).toMatchObject({ scope: "provider", enabled: false });
-    expect(container.textContent).toContain("0/5 visible");
+    expect(container.textContent).toContain("0/8 visible");
 
     // A failed poll must keep the catalog on screen but make the stale state visible.
     failCatalog = true;
     await act(async () => { poll(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
     expect(container.textContent).toContain("fallback-provider");
     expect(container.textContent).toContain("Failed to load models");
+    failCatalog = false;
+    initialSelectionPending = true;
+    await act(async () => { poll(); await new Promise(resolve => testWindow.setTimeout(resolve, 0)); });
+    expect(container.textContent).toContain("Initial discovery pending");
+    expect(switchFor("gemini-pro").disabled).toBe(true);
+    expect(buttonText("All on").disabled).toBe(true);
   } finally {
     if (root) {
       await act(async () => root?.unmount());

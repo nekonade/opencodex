@@ -24,7 +24,8 @@ veya yeniden yazmazlar.
   özel modeller, görünürlük, seçilen modeller ve bağlam sınırları.
 - [Ajanlar, yönlendirme ve entegrasyonlar](/tr/reference/cli/agents/) — çoklu
   ajan kontrolleri, kombolar, gözlemlenebilirlik, kabul anahtarları, istemci
-  entegrasyonları, çalışma zamanı ayarları ve doğrulanmış yapılandırma.
+  entegrasyonları, çalışma zamanı ayarları, doğrulanmış yapılandırma ve salt
+  okunur Codex CLI güncelleme denetimi.
 
 ## Başsız (Headless) davranış
 
@@ -35,18 +36,28 @@ yönetim API'sine gidiş-dönüş yapar. Durdurulmuş veya erişilemeyen bir pro
 yapılandırma işlemleri olarak açıkça belgelenen komutlar, bunun yerine canlı bir
 proxy olmadan yapılandırma dosyasını doğrulayabilir ve düzenleyebilir.
 
+`check` kayıt defterini sorgulamaz ve Codex’i çalıştırmaz. POSIX üzerinde çözümleyicinin seçtiği kanonik yol, yayımlanmış başlatıcının yakaladığı ortam adayıyla aynıysa `selectionAttested: true` olabilir. Bağlantılı npm-global paket bildirimi sahipliği doğrularsa ve aday sürüm bildirildiyse bu sürüm bildirimdeki sürümle eşleşirse `managed: true` olabilir; kalıcı adaylar doğrulanmaz. Windows, aday veya yapılandırma dosyalarını okumadan incelemeyi erteler. Doğrudan Bun/kaynak çalıştırması başlatıcı kanıtı sağlamaz. `plan`, yalıtılmış geçici npm yapılandırması, önbelleği ve günlükleriyle resmî kayıt defterini sorgular; etkin oturumları veya eksik süreç gözlemini reddeder. Yazılım kurmaz ve süreçlere sinyal göndermez. [Komutların ve ret nedenlerinin tam açıklamasına (İngilizce)](/reference/cli/agents/#read-only-codex-cli-update-plan) bakın.
+
+Windows x64 kurulum gözlemi için [`attest`](/tr/reference/cli/agents/) komutuna bakın. Açık yollar verilmezse komut, kanıta bağlı başlatıcı anlık görüntüsünün belirlediği seçili adayı gözlemler; güncelleme yetkisi veya çalışma zamanı seçimi doğrulanmaz.
+
 Belirsiz olmayan yerlerde liste veya durum varsayılandır. Yapılandırılmış anlık
 görüntüler için `--json` ve akışlı bir istek günlüğü akışı için `ocx observe
 logs --follow --jsonl` kullanın. Tema, dil, gezinme ve diğer tamamen görsel
 tarayıcı durumlarının CLI eşdeğeri yoktur; Cloudflare Tünel kurulumu bu komut
 kümesinin dışındadır.
 
+## Canlılık yoklaması üst sınırının geçersiz kılınması
+
+`ocx health`, `ocx status`, `ocx account *`, `ocx login codex` ve `ocx ready`, çalışan proxy'yi kısa bir canlılık yoklamasıyla bulur: varsayılan olarak deneme başına 750 ms, durdurma ve başlatma kararlarında yeniden denemelerle 1500 ms. Bir güvenlik katmanının (içerik filtresi veya EDR tarzı ağ uzantısı) her loopback bağlantısına sabit bir gecikme eklediği ana makinelerde bu sınırlar, sağlıklı bir proxy yanıt vermeden dolabilir.
+
+Bu durumda sınırları `OCX_PROBE_TIMEOUT_MS` ile yükseltin, örneğin `OCX_PROBE_TIMEOUT_MS=5000 ocx status`. Değer 1 ile 30000 arasında tam sayı milisaniyedir. Geçersiz kılma yalnızca yükseltir: 750 ms varsayılan ve 1500 ms durdurma/başlatma bütçeleri alt sınırlarını korur, bu yüzden `1000` yalnızca varsayılan yoklamayı uzatır. Boş, kesirli, negatif, sıfır veya daha büyük değerler yok sayılır.
+
 ## Çıkış kodları ve onaylama
 
 Başarılı komutlar 0 ile çıkar. Geçersiz kullanım, bilinmeyen komutlar veya
 kaynaklar, başarısız API işlemleri ve kullanılamayan gerekli servisler sıfır
 olmayan bir çıkış yapar. `ocx health` özellikle yalnızca proxy sağlıklı
-olduğunda 0 ve aksi takdirde 1 ile çıkar, bu nedenle bir servis probu olarak
+olduğunda 0, sağlıklı proxy bulunamadığında 1 ve geçersiz argümanlarda 2 ile çıkar, bu nedenle bir servis probu olarak
 kullanılabilir. Betikler insan tarafından okunabilir çıktıyı kazımak yerine
 çıkış kodunu test etmelidir.
 
@@ -67,5 +78,3 @@ kullanıcıya yönelik komutlar değil, uygulama ayrıntılarıdır. Kontrol pan
 çalışan PID'sini kaydeder, çalışanı ölen aktif bir işi kurtarır, daha eski
 PID'siz aktif kayıtları on dakika sonra eski olarak değerlendirir ve canlı bir
 çalışanı eşzamanlı güncellemelerden korur.
-
-

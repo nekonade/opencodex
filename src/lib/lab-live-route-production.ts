@@ -8,12 +8,14 @@
  * @internal host integration only
  */
 import { resolveEnvValue } from "../config";
+import { resolveProviderApiKey } from "../providers/key-store";
 import {
   getValidAccessTokenSnapshot,
   OAuthLoginRequiredError,
   UnsupportedOAuthProviderError,
 } from "../oauth";
 import type { OcxConfig } from "../types";
+import { configuredAnthropicInstance, isAnthropicOAuthInstance } from "../providers/anthropic-instance";
 import { createCredentialLease } from "../lab/live/credential-lease";
 import {
   liveUpstreamRequestPath,
@@ -33,7 +35,8 @@ export interface ProductionLabRouteExecutorDeps {
   loadConfig: () => OcxConfig;
 }
 
-async function buildLabProviderAuthHeaders(
+/** @internal exported for the Pool 2 ownership regression test. */
+export async function buildLabProviderAuthHeaders(
   routeContext: LabRouteContext,
   config: OcxConfig,
 ): Promise<Record<string, string>> {
@@ -63,6 +66,17 @@ async function buildLabProviderAuthHeaders(
     if (protocol !== "https:") {
       throw new TransportError("auth_blocked", "OAuth lab probes require HTTPS");
     }
+    // The Pool 2 credential namespace belongs to the marked builtin row only; an unmarked or
+    // orphaned `anthropic2` OAuth row must never obtain its bearer through this generic path.
+    if (isAnthropicOAuthInstance(routeContext.providerId)
+      && configuredAnthropicInstance(config, routeContext.providerId) !== routeContext.providerId) {
+      throw new TransportError("auth_blocked", "anthropic instance unavailable");
+    }
+    // The DSH account token is sent only by its own adapter to its pinned endpoint; the generic
+    // probe transport would use another endpoint and auth scheme.
+    if (routeContext.providerId === "dsh-account") {
+      throw new TransportError("auth_blocked", "dsh-account probes are not supported");
+    }
     try {
       const snapshot = await getValidAccessTokenSnapshot(routeContext.providerId);
       headers.Authorization = `Bearer ${snapshot.accessToken}`;
@@ -75,7 +89,7 @@ async function buildLabProviderAuthHeaders(
       throw new TransportError("harness_failure", "oauth refresh unavailable");
     }
   } else {
-    const apiKey = resolveEnvValue(provider.apiKey)?.trim();
+    const apiKey = resolveProviderApiKey(provider.apiKey)?.trim();
     if (!apiKey) throw new TransportError("auth_blocked", "missing api key");
     if (provider.adapter === "anthropic" && provider.apiKeyTransport === "x-api-key") {
       headers["x-api-key"] = apiKey;

@@ -22,7 +22,7 @@ test("Subagents mounts the denser workspace as the only layout", async () => {
   expect(page.match(/^ {2}return \(/gm)?.length).toBe(1);
 });
 
-test("Subagents keeps the featured-slot contract: 5 slots, reorder, remove, save", async () => {
+test("Subagents keeps the featured-slot contract: 5 slots, reorder, remove, autosave", async () => {
   const page = await Bun.file(new URL("../src/pages/Subagents.tsx", import.meta.url)).text();
   const workspace = await Bun.file(
     new URL("../src/components/subagents-workspace/SubagentsWorkspace.tsx", import.meta.url),
@@ -34,11 +34,12 @@ test("Subagents keeps the featured-slot contract: 5 slots, reorder, remove, save
   expect(workspace).toContain("export const FEATURED_MAX");
   expect(workspace).toContain("{chosen.length}/{FEATURED_MAX}");
 
-  // Reorder / remove / save controls survive in the workspace main pane.
+  // Reorder / remove controls survive in the workspace main pane; every edit saves itself.
   expect(workspace).toContain('t("sub.moveUp", { m })');
   expect(workspace).toContain('t("sub.moveDown", { m })');
   expect(workspace).toContain('t("sub.removeAria", { m })');
-  expect(workspace).toContain('t("common.save")');
+  expect(workspace).not.toContain("swi-save-row");
+  expect(page).toContain("void persistRoster(next)");
 
   // Persistence still targets the subagent-models endpoint.
   expect(page).toContain("/api/subagent-models");
@@ -56,7 +57,7 @@ test("Subagents workspace assets and i18n keys are present", async () => {
   const workspaceCss = Bun.file(new URL("../src/styles-subagents-workspace.css", import.meta.url));
   expect(await workspaceCss.exists()).toBe(true);
 
-for (const locale of ["en", "ko", "ja", "de", "ru", "zh", "zh-TW"]) {
+  for (const locale of ["en", "fr", "ko", "ja", "de", "ru", "zh", "zh-TW"]) {
     const src = await Bun.file(new URL(`../src/i18n/${locale}.ts`, import.meta.url)).text();
     expect(src).toContain("sub.workspace.");
   }

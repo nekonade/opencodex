@@ -1,3 +1,5 @@
+import type { createAnthropicThinkingRecovery } from "../server/responses/anthropic-thinking-recovery";
+import { bindAnthropicRejectionResponse } from "../adapters/anthropic-rejection-memo";
 /**
  * Media bridge agentic loop — supports both image and video generation sidecars.
  *
@@ -14,26 +16,33 @@ import type { AdapterRequest, IncomingMeta, ProviderAdapter } from "../adapters/
 import { existsSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createAdapterEventQueue } from "../adapters/run-turn-queue";
-import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderContinuationState, OcxRequestOptions, OcxThinkingContent, OcxUsage, RateLimitRetryPolicy } from "../types";
+import type { AdapterEvent, OcxMessage, OcxParsedRequest, OcxProviderContinuationState, OcxProviderOpaqueToolCallMetadata, OcxRequestOptions, OcxThinkingContent, OcxUsage, RateLimitRetryPolicy } from "../types";
 import { namespacedToolName, toolChoiceToolPredicate } from "../types";
+import { isAnthropicInstanceId } from "../providers/anthropic-instance-id";
+import { cloneProviderOpaqueToolCallMetadata } from "../responses/provider-opaque-metadata";
 import type { AttemptRecoveryKind } from "../usage/log";
 import { bridgeToResponsesSSE } from "../bridge";
+import { isTerminalRefusalIncomplete } from "../bridge/terminal-refusal";
 import { clearableDeadline, idleDeadline } from "../lib/abort";
 import { readBoundedResponseBody } from "../lib/bounded-body";
-import { fetchWithResetRetry, prepareSameTarget429Wait } from "../lib/upstream-retry";
+import { applyUpstreamRecoveryInit, fetchWithResetRetry, prepareSameTarget429Wait, isNonReplayableResponse, SendBudgetExhaustedError } from "../lib/upstream-retry";
 import { rateLimitRetryDelayMs } from "../providers/key-failover";
+import { releaseProviderRequestSlot, sendTrackingRequestSlot, type ProviderRequestSlot } from "../providers/request-pacing";
 import {
+  createTranslatorBudget,
   isTranslatorBudgetExceededError,
+  TRANSLATOR_MAX_CALL_ARGUMENT_BYTES,
   TRANSLATOR_MAX_TURN_BYTES,
   TranslatorBudgetExceededError,
 } from "../lib/translator-budget";
-import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError } from "../web-search/progress-stream";
+import { parseStreamWithProgress, RoutedModelInactivityError, WebSearchStreamProtocolError, WebSearchAdapterEventError } from "../web-search/progress-stream";
 import { fulfillImageCall } from "./fulfill";
 import { parseVideoCallArgs, pollVideoWithHeartbeats, buildVideoResult, createVideoBudget } from "./fulfill-video";
 import { submitVideoJob } from "./xai-video-client";
 import { downloadVideoToArtifact, createImageBudget, pruneArtifacts } from "./artifacts";
 import { IMAGE_GEN_TOOL_NAME, VIDEO_GEN_TOOL_NAME } from "./synthetic-tool";
 import type { ImageBridgePlan, VideoBridgePlan } from "./types";
+import { guardEmptyToolCatalogStream, type ClientToolCatalogRestriction } from "../lib/empty-tool-catalog";
 
 const SSE_HEADERS = {
   "Content-Type": "text/event-stream",
@@ -93,6 +102,62 @@ interface ImageCall {
   id: string;
   name: string;
   args: string;
+  /**
+   * Provider-opaque metadata from the originating part (issue #1735). Stored PER CALL: a
+   * signature belongs to one specific part, so parallel calls must not share one value.
+   */
+  providerMetadata?: OcxProviderOpaqueToolCallMetadata;
+}
+
+/** Independent retention owner: adapter leases and final SSE buffers have separate lifetimes. */
+function createIterationEventBudget() {
+  const budget = createTranslatorBudget();
+  let firstEvent = true;
+  let argumentBytes: number | undefined;
+  let trailingHighSurrogate = false;
+  return {
+    retain(event: AdapterEvent, coalescedIntoTail = false): void {
+      // Heartbeats are never retained or passed to scanEventsForImageCall.
+      if (event.type === "heartbeat") return;
+      if (event.type === "tool_call_start") {
+        argumentBytes = 0;
+        trailingHighSurrogate = false;
+      } else if (event.type === "tool_call_delta" && argumentBytes !== undefined) {
+        const chunk = event.arguments;
+        argumentBytes += Buffer.byteLength(chunk);
+        // A surrogate pair may straddle adapter deltas; count the concatenated UTF-8 string.
+        if (trailingHighSurrogate && /^[\uDC00-\uDFFF]/.test(chunk)) argumentBytes -= 2;
+        if (chunk.length > 0) trailingHighSurrogate = /[\uD800-\uDBFF]$/.test(chunk);
+        if (argumentBytes > TRANSLATOR_MAX_CALL_ARGUMENT_BYTES) {
+          throw new TranslatorBudgetExceededError("tool_args", TRANSLATOR_MAX_CALL_ARGUMENT_BYTES);
+        }
+      } else {
+        argumentBytes = undefined;
+        trailingHighSurrogate = false;
+      }
+      // A delta the queue merged into its buffered tail leaves one object behind, not two,
+      // so it costs the appended payload rather than another envelope. Charging the whole
+      // event here would bill over 32 MiB for the ~1 MiB that a million one-character text
+      // deltas actually retain, and abort a turn far below the documented limit.
+      const appended = coalescedIntoTail
+        ? event.type === "text_delta" ? event.text : event.type === "thinking_delta" ? event.thinking : undefined
+        : undefined;
+      if (appended !== undefined) {
+        // JSON escaping is per character, so the tail grows by the quoted form minus its
+        // quotes. A surrogate pair split across two deltas is the one over-count, by eight
+        // bytes, which bounds memory conservatively and never under-charges.
+        budget.chargeRetained(Buffer.byteLength(JSON.stringify(appended)) - 2, {
+          kind: "retained_collectors",
+        });
+        return;
+      }
+      budget.chargeRetained(Buffer.byteLength(JSON.stringify(event)) + (firstEvent ? 2 : 1), {
+        kind: "retained_collectors",
+      });
+      firstEvent = false;
+    },
+    dispose: () => budget.dispose(),
+  };
 }
 
 /**
@@ -109,13 +174,13 @@ function scanEventsForImageCall(events: AdapterEvent[], toolNames: Set<string>):
   const calls: ImageCall[] = [];
   const passthrough: AdapterEvent[] = [];
   let hasRealToolCall = false;
-  let pending: { name: string; id: string; argsBuf: string; events: AdapterEvent[] } | null = null;
+  let pending: { name: string; id: string; argsBuf: string; events: AdapterEvent[]; providerMetadata?: OcxProviderOpaqueToolCallMetadata } | null = null;
   const flushPending = (): void => {
     if (!pending) return;
     if (toolNames.has(pending.name)) {
       // Unterminated image call still carries buffered args — fulfill so malformed JSON
       // becomes a normal tool_result error instead of silently vanishing.
-      calls.push({ id: pending.id, name: pending.name, args: pending.argsBuf });
+      calls.push({ id: pending.id, name: pending.name, args: pending.argsBuf, providerMetadata: pending.providerMetadata });
     } else {
       passthrough.push(...pending.events);
       hasRealToolCall = true;
@@ -125,14 +190,14 @@ function scanEventsForImageCall(events: AdapterEvent[], toolNames: Set<string>):
   for (const e of events) {
     if (e.type === "tool_call_start") {
       flushPending();
-      pending = { name: e.name, id: e.id, argsBuf: "", events: [e] };
+      pending = { name: e.name, id: e.id, argsBuf: "", events: [e], providerMetadata: e.providerMetadata };
     } else if (e.type === "tool_call_delta" && pending) {
       pending.argsBuf += e.arguments;
       pending.events.push(e);
     } else if (e.type === "tool_call_end" && pending) {
       pending.events.push(e);
       if (toolNames.has(pending.name)) {
-        calls.push({ id: pending.id, name: pending.name, args: pending.argsBuf });
+        calls.push({ id: pending.id, name: pending.name, args: pending.argsBuf, providerMetadata: pending.providerMetadata });
       } else {
         passthrough.push(...pending.events);
         hasRealToolCall = true;
@@ -180,7 +245,11 @@ function extractIterationThinking(events: AdapterEvent[]): OcxThinkingContent[] 
   };
 
   for (const e of events) {
-    if (e.type === "thinking_delta") {
+    if (e.type === "text_delta" && e.anthropicThinkingSignature) {
+      flushVisible();
+      flushRaw();
+      parts.push({ type: "thinking", thinking: e.text, signature: e.anthropicThinkingSignature });
+    } else if (e.type === "thinking_delta") {
       flushRaw();
       thinking += e.thinking;
     } else if (e.type === "reasoning_raw_delta") {
@@ -203,17 +272,18 @@ function extractIterationThinking(events: AdapterEvent[]): OcxThinkingContent[] 
   return parts;
 }
 
-function jsonError(status: number, message: string): Response {
-  return new Response(JSON.stringify({ error: { message, type: "upstream_error", code: null } }), {
+function jsonError(status: number, message: string, event?: Extract<AdapterEvent, { type: "error" }>): Response {
+  return new Response(JSON.stringify({ error: { message, type: event?.errorType ?? "upstream_error", code: event?.code ?? null,
+    ...(event?.retryable === false ? { retryable: false } : {}) } }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(event?.retryable === false ? { "x-should-retry": "false" } : {}) },
   });
 }
 
 /** Hard provider/parse failure inside an iteration. The eager first iteration converts it to a
  *  non-2xx jsonError; later (already-streaming) iterations surface it as an in-stream error event. */
 class LoopError extends Error {
-  constructor(readonly status: number, message: string) {
+  constructor(readonly status: number, message: string, readonly event?: Extract<AdapterEvent, { type: "error" }>) {
     super(message);
     this.name = "LoopError";
   }
@@ -224,7 +294,9 @@ class LoopError extends Error {
  * metadata, and the optional image/video bridge plans.
  */
 export interface ImageBridgeDeps {
+  thinkingRecovery?: ReturnType<typeof createAnthropicThinkingRecovery>;
   parsed: OcxParsedRequest;
+  clientToolCatalogRestriction?: ClientToolCatalogRestriction;
   adapter: ProviderAdapter;
   incomingMeta: IncomingMeta;
   plan?: ImageBridgePlan;
@@ -239,6 +311,11 @@ export interface ImageBridgeDeps {
   onRequestBuilt?: (request: AdapterRequest) => void;
   abortSignal?: AbortSignal;
   onFirstOutput?: () => void;
+  /** Transfer prepaid cleanup before asynchronous inference can outlive Response construction. */
+  onProducerStart?: () => void;
+  onProducerEnd?: () => void;
+  /** Release a prepaid recovery that did not dispatch during this fetch iteration. */
+  onIterationEnd?: () => void;
   /** Max image-generation rounds before forcing a final answer. Defaults to 3; clamped to [0, 10]. */
   maxRounds?: number;
   /** Connect / response-header budget for non-runTurn iterations. */
@@ -247,19 +324,54 @@ export interface ImageBridgeDeps {
   stallTimeoutSec?: number;
   /** Provider-specific fetch (e.g. xAI transport wrapper). Falls back to global fetch. */
   fetchImpl?: typeof globalThis.fetch;
+  /** Bind physical dispatch to this iteration's built request; pacing remains owned by the loop. */
+  fetchForRequest?: (request: AdapterRequest, parsed: OcxParsedRequest, adapter: ProviderAdapter, recovery?: AttemptRecoveryKind) => typeof globalThis.fetch;
+  /** Reserve the routed provider's next request-start slot before each adapter dispatch. */
+  waitForRequestSlot?: (signal?: AbortSignal) => Promise<ProviderRequestSlot | void>;
   /** Raw adapter usage at the terminal event, pre wire-normalization (see bridgeToResponsesSSE onUsage). */
   onUsage?: (usage: OcxUsage | undefined) => void;
   /**
-   * Optional 429 key-failover for the routed (non-xAI) model. Return a rebuilt adapter for the
-   * rotated key, or null when the pool is exhausted.
+   * After an `on429` rotation, offered the usage of the hidden iterations the left credential
+   * served. Returning true means it was billed to that credential's attempt, so `onUsage` will not
+   * report it again; the client terminal still includes it.
    */
-  on429?: (retryAfterHeader: string | null) => ProviderAdapter | null;
+  onRotatedUsage?: (usage: OcxUsage) => boolean;
+  /**
+   * Optional 429 failover for the routed (non-xAI) model. Return a rebuilt adapter for the
+   * rotated credential, or null when the pool is exhausted. Async hooks support OAuth refresh;
+   * existing synchronous key-pool hooks remain valid.
+   *
+   * `responseHeaders` carries the whole refusal, not just Retry-After, because an Anthropic
+   * 429 states the window's reset epoch even when it omits Retry-After -- and a rotation that
+   * cannot see it cools the drained account for the short default instead of until the window
+   * actually reopens. Optional so existing callers keep compiling.
+   *
+   * `retryParsed` is the exact iteration-local request the retry will be built from. The loop
+   * sends a shallow copy of the outer parsed request, so a rotation that rebinds only the outer
+   * object never reaches the wire. Optional so existing callers keep compiling.
+   *
+   * A rotation may cross ACCOUNTS, not just keys, and the attempt row is where an operator reads
+   * which one happened. A rotator that knows which kind it performed returns it alongside the
+   * adapter -- the same `{ adapter, recoveryKind }` shape `onCredentialError` already uses below.
+   */
+  on429?: (
+    retryAfterHeader: string | null,
+    responseHeaders?: Headers,
+    retryParsed?: OcxParsedRequest,
+    // A 403 requires this complete response; status-only callbacks retain 429 semantics.
+    originalResponse?: Response,
+  ) =>
+    | { adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind }
+    | null
+    | Promise<{ adapter: ProviderAdapter; recoveryKind: AttemptRecoveryKind } | null>;
   /** Opt-in same-target 429 policy (key-auth providers). When present, 429 replays on the SAME key before on429 rotation. */
   retryOn429Policy?: Required<RateLimitRetryPolicy> | null;
   /** Called when the bridged Responses stream completes (parity with runTurn / routed paths). */
   onCompletedResponse?: (response: Record<string, unknown>, providerState?: OcxProviderContinuationState) => void;
   /** WebSocket Responses path only — leave response id empty for protocol compatibility. */
   forceEmptyResponseId?: boolean;
+  /** Responses inbound only: deliver a non-retryable upstream refusal as `response.failed`. */
+  terminalRefusalAsFailed?: boolean;
 }
 
 /**
@@ -284,6 +396,11 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   let paidImageCalls = 0;
   let paidVideoCalls = 0;
   let hiddenUsage: OcxUsage | undefined;
+  // Hidden usage already billed through onRotatedUsage: still on the client terminal, not in
+  // ledgerUsage, which is what onUsage reports once a rotation has moved some.
+  let rotatedUsage: OcxUsage | undefined;
+  let ledgerUsage: OcxUsage | undefined;
+  let activeProducers = 0;
 
   const addUsage = (a: OcxUsage | undefined, b: OcxUsage | undefined): OcxUsage | undefined => {
     if (!a) return b;
@@ -351,6 +468,10 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   interface IterationResponse {
     response: Response;
     responseAdapter: ProviderAdapter;
+    parsed?: OcxParsedRequest;
+    retryThinking?: () => Promise<IterationResponse>;
+    /** runTurn events are already bounded; consume them without replaying or charging twice. */
+    collectedEvents?: AdapterEvent[];
   }
   type IterationSplit = ReturnType<typeof scanEventsForImageCall>;
 
@@ -378,28 +499,31 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
 
     // runTurn adapters (Cursor) own all upstream communication via an emit callback. They don't
     // expose buildRequest/fetchResponse/parseStream to the bridge, so collect their events through
-    // an AdapterEventQueue and wrap them in a pseudo-response whose parseStream replays them.
+    // an AdapterEventQueue and pass the bounded collection directly to the common scanner.
     if (adapter.runTurn) {
+      const pacingSlot = (await deps.waitForRequestSlot?.(signal)) || undefined;
       const queue = createAdapterEventQueue({
         onBacklogExceeded: () => internalAbort.abort("runTurn backlog exceeded"),
       });
-      // Attempt telemetry must fire at dispatch time (parity with fetchOnce), not after collect.
-      deps.onAttemptSend?.();
-      void adapter
-        .runTurn(
-          iterParsed,
-          {
-            headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
-            abortSignal: signal,
-            translatorBudget,
-          },
-          queue.push,
-        )
-        .then(() => queue.close())
-        .catch(err => {
-          queue.push({ type: "error", message: err instanceof Error ? err.message : String(err) });
-          queue.close();
-        });
+      const iterationBudget = createIterationEventBudget();
+      let accepting = true;
+      let collectionError: unknown;
+      const closeOnAbort = (): void => { accepting = false; queue.close(); };
+      signal.addEventListener("abort", closeOnAbort, { once: true });
+      const emit = (event: AdapterEvent): void => {
+        if (!accepting || signal.aborted) return;
+        try {
+          // Check at emission, before even a synchronous producer can fill the queue. push
+          // reports whether it merged this delta into the buffered tail, which is what the
+          // iteration actually retains once the consumer drains it.
+          iterationBudget.retain(event, queue.push(event));
+        } catch (error) {
+          collectionError = error;
+          closeOnAbort();
+          internalAbort.abort(error);
+          throw error;
+        }
+      };
 
       // Bound collect with a real *idle* deadline that resets on each emitted event.
       // A fixed wall-clock race would abort legitimate long Cursor turns that keep
@@ -419,14 +543,43 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       });
       const events: AdapterEvent[] = [];
       try {
+        // Attempt telemetry must fire at dispatch time, not after collection.
+        deps.onAttemptSend?.();
+        activeProducers++;
+        let producer: Promise<void>;
+        try {
+          producer = adapter.runTurn(iterParsed, {
+            ...deps.incomingMeta,
+            headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
+            ...(deps.incomingMeta.providerName ? { providerName: deps.incomingMeta.providerName } : {}),
+            abortSignal: signal,
+            translatorBudget,
+            pacingSlot,
+          }, emit);
+        } catch (err) { producer = Promise.reject(err); }
+        void producer.then(closeOnAbort).catch(err => {
+          if (accepting) {
+            collectionError = err;
+            if (isTranslatorBudgetExceededError(err)) internalAbort.abort(err);
+          }
+          closeOnAbort();
+        }).finally(() => { activeProducers--; deps.onProducerEnd?.(); });
         idle.reset();
         for await (const event of queue.stream()) {
           if (timedOut) break;
           idle.reset();
-          events.push(event);
+          if (event.type !== "heartbeat") events.push(event);
         }
       } finally {
+        releaseProviderRequestSlot(pacingSlot);
+        accepting = false;
         idle.cancel();
+        signal.removeEventListener("abort", closeOnAbort);
+        iterationBudget.dispose();
+      }
+      if (collectionError) {
+        if (isTranslatorBudgetExceededError(collectionError)) throw collectionError;
+        throw new LoopError(502, collectionError instanceof Error ? collectionError.message : String(collectionError));
       }
       if (timedOut) {
         throw new LoopError(504, `runTurn inactivity timeout after ${stallTimeoutMs}ms during image-bridge`);
@@ -441,22 +594,24 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       // runTurn adapters signal errors via {type:"error"} events, not HTTP status codes.
       const errorEvent = events.find(e => e.type === "error");
       if (errorEvent && errorEvent.type === "error") {
+        hiddenUsage = addUsage(hiddenUsage, errorEvent.usage);
         if (errorEvent.code === "translation_buffer_limit") {
           throw new TranslatorBudgetExceededError("retained_collectors", TRANSLATOR_MAX_TURN_BYTES);
         }
         throw new LoopError(502, errorEvent.message);
       }
+      if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
 
-      const wrappedAdapter: ProviderAdapter = {
-        ...adapter,
-        async *parseStream() {
-          for (const e of events) yield e;
-        },
-      };
-      return { response: new Response(new Uint8Array(0), { status: 200 }), responseAdapter: wrappedAdapter };
+      return { response: new Response(new Uint8Array(0), { status: 200 }), responseAdapter: adapter, collectedEvents: events };
     }
 
     let headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+    const paceThenResetHeaderDeadline = async (): Promise<ProviderRequestSlot | undefined> => {
+      headerDeadline.clear();
+      const slot = (await deps.waitForRequestSlot?.(signal)) || undefined;
+      headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+      return slot;
+    };
     try {
       /**
        * Build and fetch one image-bridge iteration on the given adapter, under the iteration
@@ -477,6 +632,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         } else {
           request = await requestAdapter.buildRequest(iterParsed, {
             headers: deps.forwardHeaders ? new Headers(deps.forwardHeaders) : new Headers(),
+            ...(deps.incomingMeta.providerName ? { providerName: deps.incomingMeta.providerName } : {}),
             abortSignal: headerDeadline.signal,
             translatorBudget,
           });
@@ -484,39 +640,59 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
           cachedRequest = request;
           cachedAdapter = requestAdapter;
         }
+        const requestFetch = deps.fetchForRequest?.(request, iterParsed, requestAdapter, recovery) ?? fetchImpl;
         let response: Response;
         try {
           if (requestAdapter.fetchResponse) {
-            deps.onAttemptSend?.(recovery);
-            response = await requestAdapter.fetchResponse(request, {
-              abortSignal: headerDeadline.signal,
-              timeoutMs: connectTimeoutMs,
-              returnRawErrors: true,
-              stream: true,
-            });
+            const slot = await paceThenResetHeaderDeadline();
+            try {
+              deps.onAttemptSend?.(recovery);
+              response = await sendTrackingRequestSlot(slot, () => requestAdapter.fetchResponse!(request, {
+                abortSignal: headerDeadline.signal,
+                timeoutMs: connectTimeoutMs,
+                returnRawErrors: true,
+                stream: true,
+                executor: requestFetch,
+                sendBudget: deps.incomingMeta.sendBudget,
+                onPhysicalSend: deps.incomingMeta.onPhysicalSend,
+                onRecoveryWithheld: deps.incomingMeta.onRecoveryWithheld,
+              }));
+            } finally {
+              releaseProviderRequestSlot(slot);
+            }
           } else {
             response = await fetchWithResetRetry(
-              (retryRecovery) => {
-                // Record every helper-driven send (the callback runs for the first attempt and
-                // each connection-reset replay); preserve the caller's recovery kind
-                // (rate-limit-429 / key-429) when the retry layer supplies none.
-                deps.onAttemptSend?.(retryRecovery ?? recovery);
-                const h = new Headers(request.headers);
-                if (!h.has("accept-encoding")) h.set("accept-encoding", "identity");
-                return fetchImpl(request.url, {
-                  method: request.method,
-                  headers: h,
-                  body: request.body,
-                  signal: headerDeadline.signal,
-                });
+              async (retryRecovery) => {
+                const slot = await paceThenResetHeaderDeadline();
+                try {
+                  // Record every helper-driven send (the callback runs for the first attempt and
+                  // each connection-reset replay); preserve the caller's recovery kind
+                  // (rate-limit-429 / key-429) when the retry layer supplies none.
+                  deps.onAttemptSend?.(retryRecovery ?? recovery);
+                  const h = new Headers(request.headers);
+                  if (!h.has("accept-encoding")) h.set("accept-encoding", "identity");
+                  // Same reset-recovery parity as the web-search loop: the replay needs
+                  // `keepalive: false` to abandon the pooled socket, because Bun has ignored the
+                  // hop-by-hop header alone (oven-sh/bun#20492).
+                  return await sendTrackingRequestSlot(slot, () => requestFetch(request.url, applyUpstreamRecoveryInit({
+                    method: request.method,
+                    redirect: "manual",
+                    headers: h,
+                    body: request.body,
+                    signal: headerDeadline.signal,
+                  }, retryRecovery)));
+                } finally {
+                  releaseProviderRequestSlot(slot);
+                }
               },
-              { abortSignal: headerDeadline.signal, label: "image-bridge-loop" },
+              { replaySafe: true, abortSignal: headerDeadline.signal, label: "image-bridge-loop" },
             );
           }
         } finally {
           request.releaseBodyObservation?.();
         }
-        return { response, responseAdapter: requestAdapter };
+        bindAnthropicRejectionResponse(request, response);
+        return { response, responseAdapter: requestAdapter, parsed: iterParsed };
       };
 
       let prepared = await fetchOnce(adapter);
@@ -554,18 +730,34 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         prepared = await fetchOnce(adapter, "rate-limit-429");
       }
       // 429 key-failover parity with web-search / normal routed path.
-      while (prepared.response.status === 429 && deps.on429) {
-        const rotated = deps.on429(prepared.response.headers.get("retry-after"));
+      while ((prepared.response.status === 429
+        || ((prepared.response.status === 403 || prepared.response.status === 401) && isAnthropicInstanceId(deps.incomingMeta?.providerName))
+        || (iterParsed._kiroAuthContext && (prepared.response.status === 400 || prepared.response.status === 403))) && deps.on429) {
+        const rotated = await deps.on429(prepared.response.headers.get("retry-after"), prepared.response.headers,
+          iterParsed, prepared.response);
         if (!rotated) break;
+        if (hiddenUsage && deps.onRotatedUsage?.(hiddenUsage)) {
+          rotatedUsage = addUsage(rotatedUsage, hiddenUsage);
+          hiddenUsage = undefined;
+        }
         try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* already closed */ }
-        adapter = rotated;
+        adapter = rotated.adapter;
         yield { type: "heartbeat" };
-        prepared = await fetchOnce(adapter, "key-429");
+        prepared = await fetchOnce(adapter, rotated.recoveryKind);
       }
 
+      if (await deps.thinkingRecovery?.prepareHttp(prepared.response, prepared.responseAdapter.name, iterParsed)) {
+        try { void prepared.response.body?.cancel().catch(() => {}); } catch { /* closed */ }
+        cachedRequest = undefined;
+        prepared = await fetchOnce(adapter, "opaque-blob-rejection");
+      }
       // Final headers have arrived. Clear only the deadline timer before ANY body read.
       headerDeadline.clear();
       if (!prepared.response.ok) {
+        if (deps.thinkingRecovery && prepared.responseAdapter.name === "anthropic") {
+          const event = await deps.thinkingRecovery.projectHttpFailure(prepared.response, signal);
+          throw new LoopError(event.status ?? prepared.response.status, event.message, event);
+        }
         let body: Awaited<ReturnType<typeof readBoundedResponseBody>>;
         try {
           body = await readBoundedResponseBody(prepared.response, { signal });
@@ -586,9 +778,21 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
         const suffix = formatted ? `: ${formatted.slice(0, 400)}` : "";
         throw new LoopError(prepared.response.status, `Provider error ${prepared.response.status}${suffix}`);
       }
-      return prepared;
+      return { ...prepared, retryThinking: async () => {
+        cachedRequest = undefined;
+        headerDeadline = clearableDeadline(connectTimeoutMs, signal);
+        try { return await fetchOnce(adapter, "opaque-blob-rejection"); }
+        catch (error) {
+          if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
+          if (headerDeadline.didExpire()) throw new LoopError(504,
+            `Provider response-header timeout after ${connectTimeoutMs}ms during image-bridge`);
+          throw error;
+        } finally { headerDeadline.clear(); deps.onIterationEnd?.(); }
+      } };
     } catch (error) {
       if (isTranslatorBudgetExceededError(error)) throw error;
+      if (error instanceof SendBudgetExhaustedError) throw new LoopError(429, error.message,
+        { type: "error", status: 429, errorType: "rate_limit_error", code: error.code, message: error.message, retryable: false });
       if (headerDeadline.didExpire()) {
         throw new LoopError(504, `Provider response-header timeout after ${connectTimeoutMs}ms during image-bridge`);
       }
@@ -597,6 +801,7 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       throw new LoopError(502, `Provider unreachable: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       headerDeadline.clear();
+      deps.onIterationEnd?.();
     }
   };
 
@@ -610,23 +815,56 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   // Consume and validate one successful response body. Only invisible heartbeat events escape while
   // semantic output remains buffered for safe scanning.
   const consumeIterationEvents = async function* (prepared: IterationResponse): AsyncGenerator<AdapterEvent, IterationSplit> {
-    const events: AdapterEvent[] = [];
+    const events: AdapterEvent[] = prepared.collectedEvents ?? [];
+    const iterationBudget = prepared.collectedEvents ? undefined : createIterationEventBudget();
     try {
-      const parse = prepared.responseAdapter.parseStream.bind(prepared.responseAdapter);
-      for await (const event of parseStreamWithProgress(prepared.response, parse, {
-        signal,
-        inactivityTimeoutMs: stallTimeoutMs,
-        translatorBudget,
-      })) {
-        if (event.type === "heartbeat") yield event;
-        else events.push(event);
+      if (iterationBudget) {
+        const parse = async function* (current: IterationResponse): AsyncGenerator<AdapterEvent> {
+          if (!current.response.ok && deps.thinkingRecovery) {
+            yield await deps.thinkingRecovery.projectHttpFailure(current.response, signal);
+            return;
+          }
+          try {
+            yield* parseStreamWithProgress(current.response, current.responseAdapter.parseStream.bind(current.responseAdapter), {
+              signal, inactivityTimeoutMs: stallTimeoutMs, translatorBudget,
+              preserveAdapterError: deps.thinkingRecovery !== undefined,
+              onErrorUsage: usage => { hiddenUsage = addUsage(hiddenUsage, usage); },
+            });
+          } catch (error) {
+            if (!(error instanceof WebSearchAdapterEventError)) throw error;
+            if (!error.replaySafe) yield { type: "heartbeat", replayUnsafe: true };
+            yield isNonReplayableResponse(current.response)
+              ? { ...error.event, message: "Provider stream error: upstream diagnostic withheld for a non-replayable failure", retryable: false }
+              : error.event;
+          }
+        };
+        const source = deps.thinkingRecovery && prepared.retryThinking
+          ? deps.thinkingRecovery.wrap(parse(prepared), async function* () {
+              yield* parse(await prepared.retryThinking!());
+            }, () => prepared.responseAdapter.name, !isNonReplayableResponse(prepared.response), prepared.response, prepared.parsed)
+          : parse(prepared);
+        for await (const event of source) {
+          if (event.type === "heartbeat") yield event;
+          else {
+            iterationBudget.retain(event);
+            events.push(event);
+          }
+        }
       }
     } catch (error) {
-      if (isTranslatorBudgetExceededError(error)) throw error;
+      if (isTranslatorBudgetExceededError(error)) {
+        internalAbort.abort(error);
+        throw error;
+      }
       if (signal.aborted) throw new LoopError(499, "client closed request during image-bridge");
+      if (error instanceof LoopError) throw error;
+      if (error instanceof SendBudgetExhaustedError) throw new LoopError(429, error.message,
+        { type: "error", status: 429, errorType: "rate_limit_error", code: error.code, message: error.message, retryable: false });
       if (error instanceof RoutedModelInactivityError) throw new LoopError(504, error.message);
       if (error instanceof WebSearchStreamProtocolError) throw new LoopError(502, error.message);
       throw new LoopError(502, `Provider stream error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      iterationBudget?.dispose();
     }
 
     const terminalIndexes = events.flatMap((event, index) =>
@@ -639,8 +877,9 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
       if (terminal.code === "translation_buffer_limit") {
         throw new TranslatorBudgetExceededError("retained_collectors", TRANSLATOR_MAX_TURN_BYTES);
       }
-      throw new LoopError(502, terminal.message);
+      throw new LoopError(terminal.status ?? 502, terminal.message, terminal);
     }
+    deps.thinkingRecovery?.observeIteration(events);
     return scanEventsForImageCall(events, mediaToolNames);
   };
 
@@ -648,24 +887,34 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
   // non-2xx JSON. Skip for runTurn adapters: their "headers" are synthetic, and awaiting
   // queue.collect() before returning SSE starves clients of headers/heartbeats on slow first turns.
   const skipEagerDrain = !!adapter.runTurn;
+  if (skipEagerDrain) deps.onProducerStart?.();
   let firstPrepared: IterationResponse | undefined;
   if (!skipEagerDrain) {
     try {
       firstPrepared = await prepareIterationDrained(maxRounds <= 0);
     } catch (e) {
       if (abortSignal) abortSignal.removeEventListener("abort", linkAbort);
-      if (e instanceof LoopError) return jsonError(e.status, e.message);
+      if (e instanceof LoopError) return jsonError(e.status, e.message, e.event);
+      if (e instanceof SendBudgetExhaustedError) return jsonError(429, e.message,
+        { type: "error", status: 429, errorType: "rate_limit_error", code: e.code, message: e.message, retryable: false });
       throw e;
     }
   }
 
-  const toolNsMap = new Map<string, { namespace: string; name: string }>();
+  const toolNsMap = new Map<string, { namespace: string; name: string; freeform?: true }>();
   const freeform = new Set<string>();
   const toolSearch = new Set<string>();
-  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice);
-  for (const t of parsed.context.tools ?? []) {
+  const requestedTools = parsed.context.tools ?? [];
+  const toolAllowed = toolChoiceToolPredicate(parsed.options.toolChoice, requestedTools);
+  for (const t of requestedTools) {
     if (!toolAllowed(t)) continue;
-    if (t.namespace) toolNsMap.set(namespacedToolName(t.namespace, t.name), { namespace: t.namespace, name: t.name });
+    if (t.namespace) {
+      toolNsMap.set(namespacedToolName(t.namespace, t.name), {
+        namespace: t.namespace,
+        name: t.name,
+        ...(t.freeform ? { freeform: true } : {}),
+      });
+    }
     if (t.freeform) freeform.add(t.name);
     if (t.toolSearch) toolSearch.add(t.name);
   }
@@ -691,13 +940,17 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
           // Loop (fulfill + re-ask) ONLY when the model's actionable output is purely image_gen. A
           // real tool call means this turn is terminal for Codex — finalize so those calls reach
           // Codex. forceFinal also finalizes.
-          const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall && !forceFinal;
+          // A refused iteration also finalizes: fulfilling its media call would re-ask the model
+          // with the refused context (#7148).
+          const shouldLoop = split.calls.length > 0 && !split.hasRealToolCall && !forceFinal
+            && !split.passthrough.some(isTerminalRefusalIncomplete);
           if (!shouldLoop) {
-            if (hiddenUsage) {
+            if (hiddenUsage || rotatedUsage) {
               for (let i = split.passthrough.length - 1; i >= 0; i--) {
                 const e = split.passthrough[i];
                 if (e?.type === "done" || e?.type === "incomplete") {
-                  split.passthrough[i] = { ...e, usage: addUsage(hiddenUsage, e.usage) };
+                  ledgerUsage = addUsage(hiddenUsage, e.usage);
+                  split.passthrough[i] = { ...e, usage: addUsage(rotatedUsage, ledgerUsage) };
                   break;
                 }
               }
@@ -708,6 +961,10 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
 
           // Discarded iteration still contributed tokens — accumulate for the final onUsage.
           takeUsageFrom(split.passthrough);
+
+          for (const event of split.passthrough) {
+            if (event.type === "text_delta" && event.anthropicThinkingSignature) yield event;
+          }
 
           // Fulfill each image/video call, then inject ONE assistant turn (thinking once + all tool
           // calls) so Anthropic extended-thinking continuations stay valid across parallel calls.
@@ -861,6 +1118,10 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
                 id: call.id,
                 name: call.name,
                 arguments: args,
+                // Clone per call: parallel media calls each keep their own signature.
+                ...(cloneProviderOpaqueToolCallMetadata(call.providerMetadata)
+                  ? { providerMetadata: cloneProviderOpaqueToolCallMetadata(call.providerMetadata) }
+                  : {}),
               })),
             ],
             timestamp: now,
@@ -876,6 +1137,8 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
             });
           }
         } catch (e) {
+          ledgerUsage = hiddenUsage;
+          const usage = addUsage(rotatedUsage, hiddenUsage);
           if (isTranslatorBudgetExceededError(e)) {
             yield {
               type: "error",
@@ -883,39 +1146,43 @@ export async function runWithImageBridge(deps: ImageBridgeDeps): Promise<Respons
               errorType: "upstream_error",
               code: e.code,
               message: "upstream translation buffer exceeded the safe limit",
-              ...(hiddenUsage ? { usage: hiddenUsage } : {}),
+              ...(usage ? { usage } : {}),
             };
           } else {
             yield {
               type: "error",
               message: e instanceof LoopError ? e.message : (e instanceof Error ? e.message : String(e)),
-              ...(e instanceof LoopError ? { status: e.status } : {}),
-              ...(hiddenUsage ? { usage: hiddenUsage } : {}),
+              ...(e instanceof LoopError ? { status: e.status, ...(e.event ?? {}) } : {}),
+              ...(usage ? { usage } : {}),
             };
           }
           return;
         }
       }
     } finally {
+      if (skipEagerDrain && activeProducers === 0) deps.onProducerEnd?.();
       if (abortSignal) abortSignal.removeEventListener("abort", linkAbort);
     }
   }
 
   const sse = bridgeToResponsesSSE(
-    produce(), parsed._responseModelId ?? parsed.modelId, toolNsMap, freeform, toolSearch, () => {
+    guardEmptyToolCatalogStream(produce(), deps.clientToolCatalogRestriction, translatorBudget), parsed._responseModelId ?? parsed.modelId, toolNsMap, freeform, toolSearch, () => {
       internalAbort.abort("client closed responses stream");
     }, 2_000,
     {
       translatorBudget,
       replayCacheScope: parsed._reasoningReplayScope,
+      ...(deps.clientToolCatalogRestriction ? { ...deps.clientToolCatalogRestriction, enforceDeclaredToolNames: false } : {}),
       ...(deps.forceEmptyResponseId ? { responseId: "" } : {}),
+      ...(deps.terminalRefusalAsFailed ? { terminalRefusalAsFailed: true } : {}),
       hideThinkingSummary: parsed.options.hideThinkingSummary,
+      hideRawReasoning: parsed.options.hideRawReasoning,
       stallTimeoutSec: deps.stallTimeoutSec,
       ...(deps.onFirstOutput ? { onFirstOutput: deps.onFirstOutput } : {}),
       ...(deps.onUsage ? {
         // Terminal done/incomplete already includes hiddenUsage (merged above). Do not
         // add it again here or request logs double-count multi-iteration image turns.
-        onUsage: (usage: OcxUsage | undefined) => deps.onUsage?.(usage),
+        onUsage: (usage: OcxUsage | undefined) => deps.onUsage?.(rotatedUsage ? ledgerUsage : usage),
       } : {}),
       ...(deps.onCompletedResponse ? { onCompletedResponse: deps.onCompletedResponse } : {}),
     },

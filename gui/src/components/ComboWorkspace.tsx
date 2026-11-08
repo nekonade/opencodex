@@ -5,6 +5,8 @@ import {
   emptyDraft,
   filterCombos,
   groupCombos,
+  jevAutoDraft,
+  jevDecisionProviderIssue,
 } from "../combo-workspace-data";
 import { IconChevron, IconPlus, IconSearch, IconShuffle } from "../icons";
 import { useT } from "../i18n/shared";
@@ -17,22 +19,34 @@ import type { ComboWorkspaceProps } from "./combo-workspace-types";
 export type { ModelOption, ProviderOption, ComboWorkspaceProps } from "./combo-workspace-types";
 
 export default function ComboWorkspace({
+  apiBase,
   combos,
+  providerQuotaStates,
   providers,
   models,
+  capabilityModels = models,
   cataloguedComboIds,
+  visionEnabled,
   loading,
   onRefresh,
   onSave,
   onRemove,
   onAdd,
   adding,
+  addIntent,
+  addDecisionProvider,
   onCloseAdd,
   onCreated,
 }: ComboWorkspaceProps) {
   const t = useT();
   const providerMap = useMemo(
-    () => Object.fromEntries(providers.map((provider) => [provider.name, { disabled: provider.disabled }])),
+    () => Object.fromEntries(providers.map((provider) => [provider.name, {
+      disabled: provider.disabled,
+      adapter: provider.adapter,
+      baseUrl: provider.baseUrl,
+      defaultModel: provider.defaultModel,
+      models: provider.models,
+    }])),
     [providers],
   );
   const [query, setQuery] = useState("");
@@ -41,6 +55,25 @@ export default function ComboWorkspace({
   const [removeId, setRemoveId] = useState<string | null>(null);
   const [localBaseline, setLocalBaseline] = useState<ComboItem | null>(null);
   const firstComboDraft = useMemo(() => emptyDraft(), []);
+  const jevAutoExists = useMemo(
+    () => combos.some(combo => combo.id === "jev-auto" || combo.alias === "jev-auto"),
+    [combos],
+  );
+  const jevTargetProviders = useMemo(
+    () => new Set(providers
+      .filter(provider => !provider.disabled
+        && !provider.hiddenFromPicker
+        && provider.adapter !== "jev-decision")
+      .map(provider => provider.name)),
+    [providers],
+  );
+  const addDraft = useMemo(() => {
+    if (addIntent !== "jev-auto") return undefined;
+    // A deep-linked row that is not a usable decision service falls back to TypeSafe.
+    const usable = providers.length === 0
+      || jevDecisionProviderIssue(addDecisionProvider, providerMap) === null;
+    return jevAutoDraft(models, jevTargetProviders, usable ? addDecisionProvider : null);
+  }, [addDecisionProvider, addIntent, jevTargetProviders, models, providerMap, providers.length]);
 
   const filtered = useMemo(() => filterCombos(combos, query), [combos, query]);
   const sections = useMemo(() => groupCombos(filtered), [filtered]);
@@ -87,7 +120,7 @@ export default function ComboWorkspace({
   const cancelPending = () => setPendingSelect(undefined);
 
   const showUnsaved = pendingSelect !== undefined && detailDirty;
-  const creatingFirstCombo = !loading && combos.length === 0;
+  const creatingFirstCombo = !loading && combos.length === 0 && !adding;
   const handleAdd = () => {
     if (creatingFirstCombo) {
       document.getElementById("cwi-edit-id")?.focus();
@@ -108,6 +141,20 @@ export default function ComboWorkspace({
             <IconPlus width={14} height={14} /> {t("cws.add")}
           </button>
         </div>
+        <div className="cwi-jev-quick-action">
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            onClick={() => onAdd("jev-auto")}
+            disabled={jevAutoExists}
+            title={jevAutoExists ? t("cws.jev.exists") : t("cws.jev.setupHint")}
+          >
+            <IconShuffle width={14} height={14} /> {t("cws.jev.create")}
+          </button>
+          {jevAutoExists && <span className="muted">{t("cws.jev.exists")}</span>}
+        </div>
+        {/* Search has no decision value until at least one combo exists. */}
+        {combos.length > 0 && (
         <div className="cwi-search-row">
           <div className="cwi-search-wrap">
             <IconSearch className="cwi-search-icon" aria-hidden="true" />
@@ -120,6 +167,7 @@ export default function ComboWorkspace({
             />
           </div>
         </div>
+        )}
         <div className="combos-workspace-rail-list">
           {filtered.length === 0 && combos.length > 0 ? (
             <p className="muted" style={{ padding: "16px" }}>{t("cws.noSearchResults")}</p>
@@ -128,6 +176,7 @@ export default function ComboWorkspace({
               {([
                 ["failover", sections.failover, "cws.group.failover"],
                 ["round-robin", sections.roundRobin, "cws.group.roundRobin"],
+                ["other", sections.other, "cws.group.other"],
               ] as const).map(([key, items, labelKey]) => (
                 items.length > 0 ? (
                   <div key={key} className="combos-workspace-rail-group">
@@ -168,12 +217,17 @@ export default function ComboWorkspace({
         {baseline ? (
           <DetailPanel
             key={baseline.id}
+            apiBase={apiBase}
             baseline={baseline}
+            combos={combos.filter((c) => c.id !== baseline.id)}
             otherIds={otherComboIds}
             otherAliases={otherComboAliases}
             providerMap={providerMap}
+            providerQuotaStates={providerQuotaStates}
             providers={providers}
             models={models}
+            capabilityModels={capabilityModels}
+            visionEnabled={visionEnabled}
             onBack={() => trySelect(null)}
             onSaved={(item) => {
               setDetailDirty(false);
@@ -194,13 +248,17 @@ export default function ComboWorkspace({
         ) : creatingFirstCombo ? (
           <DetailPanel
             key="first-combo"
+            apiBase={apiBase}
             baseline={firstComboDraft}
             isCreate
             otherIds={[]}
             otherAliases={[]}
             providerMap={providerMap}
+            providerQuotaStates={providerQuotaStates}
             providers={providers}
             models={models}
+            capabilityModels={capabilityModels}
+            visionEnabled={visionEnabled}
             onSaved={(item) => {
               setDetailDirty(false);
               setSelectedId(item.id);
@@ -214,19 +272,28 @@ export default function ComboWorkspace({
           <OverviewPanel
             combos={combos}
             cataloguedComboIds={cataloguedComboIds}
+            providerMap={providerMap}
+            providerQuotaStates={providerQuotaStates}
+            providers={providers}
             onSelect={(id) => trySelect(id)}
             onAdd={onAdd}
           />
         )}
       </div>
 
-      {adding && !creatingFirstCombo && (
+      {adding && (
         <AddComboModal
+          key={`${addIntent ?? "blank"}:${addDraft?.decisionProvider ?? ""}`}
+          apiBase={apiBase}
+          combos={combos}
           existingIds={combos.map((c) => c.id)}
           existingAliases={existingComboAliases}
           providerMap={providerMap}
+          providerQuotaStates={providerQuotaStates}
           providers={providers}
           models={models}
+          capabilityModels={capabilityModels}
+          initialDraft={addDraft}
           onClose={onCloseAdd}
           onSubmit={async (item) => {
             const res = await onSave(item, true);

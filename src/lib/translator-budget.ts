@@ -1,3 +1,5 @@
+import { isNonReplayableResponse, markResponseNonReplayable } from "./upstream-retry";
+
 export const TRANSLATOR_MAX_CALL_ARGUMENT_BYTES = 2 * 1024 * 1024;
 export const TRANSLATOR_MAX_TURN_BYTES = 32 * 1024 * 1024;
 export const TRANSLATOR_MAX_SSE_EVENT_BYTES = 32 * 1024 * 1024;
@@ -72,20 +74,55 @@ export interface TranslatorBudget {
 const retainedEventOwnership = new WeakMap<object, { budget: TranslatorBudget; bytes: number }>();
 
 /**
+ * Charge one event appended to an incrementally materialized adapter-event batch.
+ * The newest event owns the closing array bracket; moving that byte from the old
+ * tail keeps in-order release accounting equal to the still-retained JSON array.
+ */
+export function retainTranslatedEvent<T extends object>(
+  event: T,
+  budget: TranslatorBudget,
+  previousTail?: object,
+): void {
+  if (retainedEventOwnership.has(event)) {
+    throw new Error("translated event is already retained");
+  }
+  if (previousTail === event) {
+    throw new Error("incremental translated event tail must be a distinct object");
+  }
+  const previousOwnership = previousTail === undefined
+    ? undefined
+    : retainedEventOwnership.get(previousTail);
+  if (
+    previousTail !== undefined
+    && (!previousOwnership || previousOwnership.budget !== budget || previousOwnership.bytes < 2)
+  ) {
+    throw new Error("incremental translated event tail is not retained by this budget");
+  }
+
+  const serializedBytes = Buffer.byteLength(JSON.stringify(event));
+  budget.chargeRetained(serializedBytes + (previousTail === undefined ? 2 : 1), {
+    kind: "retained_collectors",
+  });
+  if (previousOwnership) previousOwnership.bytes -= 1;
+  retainedEventOwnership.set(event, { budget, bytes: serializedBytes + 2 });
+}
+
+/**
  * Charge a materialized adapter-event batch and attach its lease to the events themselves.
  * A copied event array (for example terminal-guard collection) preserves the event objects, so
  * the response builder can consume each source lease immediately after its replacement lands.
  */
 export function retainTranslatedEventBatch<T extends object>(events: T[], budget: TranslatorBudget): void {
   if (events.length === 0) return;
-  const serialized = events.map(event => JSON.stringify(event));
-  const totalBytes = Buffer.byteLength(`[${serialized.join(",")}]`);
+  // Preserve atomic batch admission without retaining serialized strings or joining a second copy.
+  const eventBytes = events.map(event => Buffer.byteLength(JSON.stringify(event)));
+  const totalBytes = eventBytes.reduce((total, bytes) => total + bytes, events.length + 1);
   budget.chargeRetained(totalBytes, { kind: "retained_collectors" });
   for (let index = 0; index < events.length; index++) {
     const delimiterBytes = index === events.length - 1 ? 2 : 1;
     retainedEventOwnership.set(events[index]!, {
       budget,
-      bytes: Buffer.byteLength(serialized[index]!) + delimiterBytes,
+      bytes: eventBytes[index]! + delimiterBytes,
     });
   }
 }
@@ -156,6 +193,7 @@ class Budget implements TranslatorBudget {
   }
 
   openCall(id: string): void {
+    if (this.disposed) return;
     if (!this.calls.has(id)) {
       this.calls.set(id, { logicalBytes: 0, physicalBytes: 0 });
       aggregateActiveCalls += 1;
@@ -175,6 +213,7 @@ class Budget implements TranslatorBudget {
     bytes: number,
     scope: { kind: TranslatorBufferKind; callId?: string },
   ): TranslatorTransientReservation {
+    if (this.disposed) return { commitRetained() {}, release() {} };
     const admitted = normalizeBytes(bytes);
     if (scope.callId && admitted > this.maxCallArgumentBytes) {
       this.reject("tool_args", this.maxCallArgumentBytes);
@@ -187,6 +226,7 @@ class Budget implements TranslatorBudget {
     return {
       commitRetained: () => {
         if (state !== "reserved") return;
+        if (this.disposed) { state = "released"; return; }
         state = "committed";
         if (!scope.callId) return;
         const call = this.calls.get(scope.callId) ?? { logicalBytes: 0, physicalBytes: 0 };
@@ -199,6 +239,7 @@ class Budget implements TranslatorBudget {
       release: () => {
         if (state !== "reserved") return;
         state = "released";
+        if (this.disposed) return;
         this.charged.set(scope.kind, Math.max(0, (this.charged.get(scope.kind) ?? 0) - admitted));
         this.hardChargedBytes = Math.max(0, this.hardChargedBytes - admitted);
         this.changed();
@@ -207,6 +248,7 @@ class Budget implements TranslatorBudget {
   }
 
   chargeRetained(delta: number, scope: { kind: TranslatorBufferKind; callId?: string }): void {
+    if (this.disposed) return;
     const admitted = normalizeBytes(delta);
     if (scope.callId) {
       const call = this.calls.get(scope.callId) ?? { logicalBytes: 0, physicalBytes: 0 };
@@ -244,6 +286,7 @@ class Budget implements TranslatorBudget {
   }
 
   private observe(bytes: number): () => void {
+    if (this.disposed) return () => {};
     const observed = normalizeBytes(bytes);
     this.observedBytes += observed;
     this.changed();
@@ -334,7 +377,7 @@ export function resetTranslatorAggregateForTests(): void {
   aggregateOverflows = 0;
 }
 
-export function finalizeTranslatorBudgetResponse(response: Response, budget: TranslatorBudget): Response {
+export function finalizeTranslatorBudgetResponse(response: Response, budget: TranslatorBudget, signal?: AbortSignal): Response {
   if (!response.body) {
     budget.dispose();
     return response;
@@ -344,9 +387,12 @@ export function finalizeTranslatorBudgetResponse(response: Response, budget: Tra
   const finalize = () => {
     if (finalized) return;
     finalized = true;
+    signal?.removeEventListener("abort", finalize);
     budget.dispose();
   };
-  return new Response(new ReadableStream<Uint8Array>({
+  // The transport owns cancellation and terminal precedence. Abort releases only
+  // accounting here, including when no consumer ever pulls or cancels this body.
+  const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const result = await reader.read();
@@ -360,7 +406,15 @@ export function finalizeTranslatorBudgetResponse(response: Response, budget: Tra
       }
     },
     async cancel(reason) {
-      try { await reader.cancel(reason); } finally { finalize(); }
+      finalize();
+      await reader.cancel(reason);
     },
-  }), { status: response.status, statusText: response.statusText, headers: response.headers });
+  });
+  if (signal?.aborted) finalize();
+  else signal?.addEventListener("abort", finalize, { once: true });
+  const finalizedResponse = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  // The rebuild above drops identity markers. A refusal that must not be replayed
+  // stays non-replayable through accounting finalization.
+  if (isNonReplayableResponse(response)) markResponseNonReplayable(finalizedResponse);
+  return finalizedResponse;
 }

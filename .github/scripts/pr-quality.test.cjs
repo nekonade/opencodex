@@ -16,6 +16,8 @@ const {
   buildReviewReadinessSection,
   extractReviewReadiness,
   appendReviewReadinessSection,
+  reviewReadinessMigrationRequired,
+  reviewReadinessUsesCurrentPolicy,
   stripReviewReadinessSection,
   uncheckReviewReadinessBoxes,
   REVIEW_READINESS_CLAIM_INDEX,
@@ -66,6 +68,10 @@ describe("assessPrDescription", () => {
     assert.equal(assessPrDescription("   ").ok, false);
     assert.equal(
       assessPrDescription("<!-- release notes by coderabbit.ai -->\n\n<!-- end -->").reason,
+      "empty",
+    );
+    assert.equal(
+      assessPrDescription("<!--\n![proof](https://example.invalid/screenshot.png)").reason,
       "empty",
     );
   });
@@ -291,6 +297,10 @@ describe("hasScreenshotEvidence", () => {
       hasScreenshotEvidence('<!-- <img src="https://example.com/ui.png"> -->'),
       false,
     );
+    assert.equal(
+      hasScreenshotEvidence("<!--\n![after](https://example.com/after.png)"),
+      false,
+    );
   });
 
   it("rejects img tags without a renderable src and references without a definition", () => {
@@ -401,7 +411,7 @@ describe("review readiness checklist", () => {
 
   it("treats a reworded but complete section as complete", () => {
     const reworded = SECTION
-      .replace("All CI tests are green on my local testing.", "Local suite green.")
+      .replace("Required local validation passed; commands, results, and any full-suite exception are documented.", "Local suite green.")
       .replaceAll("- [ ] ", "- [x] ");
     const result = extractReviewReadiness(reworded);
     assert.equal(result.present, true);
@@ -577,7 +587,7 @@ describe("uncheckReviewReadinessBoxes", () => {
     "<!-- pr-quality-readiness-checklist:start -->",
     "## Review readiness checklist",
     "",
-    "- [x] All CI tests are green on my local testing.",
+    "- [x] Required local validation passed; commands, results, and any full-suite exception are documented.",
     "- [x] I pushed my PR to the latest dev commit.",
     "- [x] I resolved all correct Codex and CodeRabbit findings.",
     "- [x] My PR is ready for review.",
@@ -588,7 +598,7 @@ describe("uncheckReviewReadinessBoxes", () => {
     const body = uncheckReviewReadinessBoxes(checkedBody, [
       REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
-    assert.ok(body.includes("- [x] All CI tests are green on my local testing."));
+    assert.ok(body.includes("- [x] Required local validation passed; commands, results, and any full-suite exception are documented."));
     assert.ok(body.includes("- [ ] I pushed my PR to the latest dev commit."));
     assert.ok(body.includes("- [x] My PR is ready for review."));
   });
@@ -598,7 +608,7 @@ describe("uncheckReviewReadinessBoxes", () => {
       0,
       REVIEW_READINESS_CLAIM_INDEX.latest_dev,
     ]);
-    assert.ok(body.includes("- [ ] All CI tests are green on my local testing."));
+    assert.ok(body.includes("- [ ] Required local validation passed; commands, results, and any full-suite exception are documented."));
     assert.ok(body.includes("- [ ] I pushed my PR to the latest dev commit."));
     assert.ok(body.includes("- [x] I resolved all correct Codex and CodeRabbit findings."));
     assert.ok(body.includes("- [x] My PR is ready for review."));
@@ -636,7 +646,7 @@ describe("assessPrDescription with the readiness section", () => {
     "",
     "## Test plan",
     "",
-    "- Ran bun test tests/ci-workflows.test.ts",
+    "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
   ].join("\n");
 
   it("never counts the injected checklist as description substance", () => {
@@ -662,7 +672,7 @@ describe("collectPrQualityFailures", () => {
     "This change fixes the provider list spacing in the dashboard.",
     "",
     "## Test plan",
-    "- Ran bun test tests/ci-workflows.test.ts",
+    "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
   ].join("\n");
 
   it("reports wrong_base without requiring ancestry inputs", () => {
@@ -897,7 +907,7 @@ describe("collectPrQualityFailures", () => {
         "No gui changes in this PR; proxy routing only.",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -917,7 +927,7 @@ describe("collectPrQualityFailures", () => {
         "This change adjusts gui/ spacing tokens used by the dashboard.",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -937,7 +947,7 @@ describe("collectPrQualityFailures", () => {
         "This change adjusts gui/ spacing tokens used by the dashboard.",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -960,7 +970,7 @@ describe("collectPrQualityFailures", () => {
         "This change adjusts gui/ spacing tokens used by the dashboard.",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -985,7 +995,7 @@ describe("collectPrQualityFailures", () => {
         "![after](https://example.com/after.png)",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -1009,7 +1019,7 @@ describe("collectPrQualityFailures", () => {
         "[shot]: https://example.com/after.png",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -1033,7 +1043,7 @@ describe("collectPrQualityFailures", () => {
         "```",
         "",
         "## Test plan",
-        "- Ran bun test tests/ci-workflows.test.ts",
+        "- Ran bun test tests/ci-workflows/ci-workflows.test.ts",
       ].join("\n"),
       behindMain: 0,
       behindBase: 0,
@@ -1066,5 +1076,125 @@ describe("collectPrQualityFailures", () => {
       authorPermission: "read",
     });
     assert.ok(!failures.some((f) => f.code === "missing_ui_screenshot"));
+  });
+});
+
+describe("comment stripping respects fenced code (regression)", () => {
+  it("keeps a screenshot that follows a comment-like literal in a fence", () => {
+    // GFM treats fence contents as literal text, so `<!--` inside a code sample
+    // never opens an HTML comment. Stripping comments before fences let the
+    // unclosed literal run to EOF and swallow the real screenshot below it,
+    // rejecting a valid GUI PR.
+    const body = [
+      "Example of a raw HTML comment:",
+      "",
+      "```html",
+      "<!-- literal unclosed-comment example",
+      "```",
+      "",
+      "![after](https://example.invalid/after.png)",
+    ].join("\n");
+
+    assert.equal(hasScreenshotEvidence(body), true);
+  });
+
+  it("still ignores a screenshot inside a real HTML comment", () => {
+    const body = ["<!--", "![hidden](https://example.invalid/hidden.png)", "-->"].join("\n");
+    assert.equal(hasScreenshotEvidence(body), false);
+  });
+});
+
+// #4443: the box used to ask for the exact `dev` tip while the gate cleared the
+// claim at up to READINESS_LATEST_DEV_BEHIND_MAX behind. On a fast-moving dev an
+// author reading the box literally resyncs for unrelated commits, every resync
+// moves the head, head-drift unticks all four boxes, and the exact-head CI
+// evidence is thrown away — with no reduction in merge risk, because the gate
+// was already satisfied.
+describe("the latest-dev readiness box states the condition the gate enforces", () => {
+  const {
+    READINESS_LATEST_DEV_BEHIND_MAX,
+    readinessClaimViolations,
+  } = require("./pr-quality-state.cjs");
+
+  const latestDevItem = () =>
+    REVIEW_READINESS_ITEMS[REVIEW_READINESS_CLAIM_INDEX.latest_dev];
+
+  it("no longer demands the exact tip", () => {
+    assert.ok(!/latest dev commit/i.test(latestDevItem()));
+  });
+
+  it("names the threshold the gate actually uses", () => {
+    // Derived, not transcribed: the sentence carries the same number
+    // `readinessClaimViolations` compares against.
+    assert.ok(latestDevItem().includes(String(READINESS_LATEST_DEV_BEHIND_MAX)));
+  });
+
+  it("promises exactly what the gate clears", () => {
+    // The sentence is only honest if the gate agrees at the boundary.
+    assert.deepEqual(
+      readinessClaimViolations({ behindBase: READINESS_LATEST_DEV_BEHIND_MAX }),
+      []
+    );
+    assert.deepEqual(
+      readinessClaimViolations({ behindBase: READINESS_LATEST_DEV_BEHIND_MAX + 1 }),
+      ["latest_dev"]
+    );
+  });
+
+  it("still leaves the exact tip available to a maintainer", () => {
+    assert.match(latestDevItem(), /maintainer/i);
+  });
+
+  it("keeps the four-box contract", () => {
+    assert.equal(REVIEW_READINESS_ITEMS.length, 4);
+    const section = buildReviewReadinessSection();
+    assert.equal((section.match(/^\s*[-*]\s+\[[ xX]\]\s+/gm) || []).length, 4);
+  });
+
+  it("does not disturb a checklist that already carries the old wording", () => {
+    // The compatibility contract: `extractReviewReadiness` reads box count and
+    // checked state, never item text, and appending is idempotent. An open PR
+    // keeps its sentence and its ticks.
+    const legacy = [
+      "Body.",
+      "",
+      "<!-- pr-quality-readiness-checklist:start -->",
+      "## Review readiness checklist",
+      "",
+      "- [x] All CI tests are green on my local testing.",
+      "- [x] I pushed my PR to the latest dev commit.",
+      "- [x] I resolved all correct Codex and CodeRabbit findings.",
+      "- [x] My PR is ready for review.",
+      "<!-- pr-quality-readiness-checklist:end -->",
+    ].join("\n");
+
+    const readiness = extractReviewReadiness(legacy);
+    assert.equal(readiness.complete, true);
+    assert.equal(readiness.total, 4);
+    assert.equal(appendReviewReadinessSection(legacy), legacy);
+  });
+});
+
+describe("managed checklist wording classification", () => {
+  const oldItem = "All CI tests are green on my local testing.";
+  const legacy = buildReviewReadinessSection().replace(REVIEW_READINESS_ITEMS[0], oldItem);
+  for (const mark of [" ", "x", "X"]) {
+    for (const ending of ["\n", "\r\n"]) {
+      it(`recognizes old first item with ${JSON.stringify(mark)} and ${JSON.stringify(ending)}`, () => {
+        const body = legacy.replace(`- [ ] ${oldItem}`, ` * [${mark}] ${oldItem}  `).replaceAll("\n", ending);
+        assert.equal(reviewReadinessMigrationRequired(body), true);
+        assert.equal(reviewReadinessUsesCurrentPolicy(body), false);
+      });
+    }
+  }
+  it("preserves custom later labels and refuses malformed or displaced first items", () => {
+    assert.equal(reviewReadinessMigrationRequired(legacy.replace(REVIEW_READINESS_ITEMS[1], "Author's branch attestation.")), true);
+    for (const body of [null, "", oldItem, legacy + legacy,
+      legacy.replace("<!-- pr-quality-readiness-checklist:end -->", ""),
+      legacy.replace(oldItem, oldItem + " Extra"),
+      legacy.replace(oldItem, "Custom").replace(REVIEW_READINESS_ITEMS[1], oldItem),
+      legacy.replace(`- [ ] ${REVIEW_READINESS_ITEMS[3]}`, ""),
+    ]) assert.equal(reviewReadinessMigrationRequired(body), false);
+    assert.equal(reviewReadinessUsesCurrentPolicy(buildReviewReadinessSection()), true);
   });
 });

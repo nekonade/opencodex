@@ -40,20 +40,50 @@ export function claudeCodeSessionId(token: string | undefined): string {
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${variant}${h.slice(17, 20)}-${h.slice(20, 32)}`;
 }
 
-// ── Antigravity CLI ──
-/** Pinned fallback Antigravity CLI version (real client fetches a manifest; we pin to avoid the network dependency). */
-export const ANTIGRAVITY_CLI_VERSION = "1.0.13";
-const ANTIGRAVITY_CLI_CLIENT_NAME = "aidev_client";
-const ANTIGRAVITY_CLI_PLATFORM = "darwin/arm64";
-/** Secondary Google API client UA the Antigravity client library reports. */
-export const ANTIGRAVITY_GOOG_API_CLIENT_UA = "google-api-nodejs-client/10.3.0";
+// ── Antigravity IDE ──
+/** Pinned fallback Antigravity IDE language-server version (matches the bundled LS 2.5.5). */
+export const ANTIGRAVITY_IDE_VERSION = "2.5.5";
+const ANTIGRAVITY_IDE_CLIENT_NAME = "aidev_client";
+const ANTIGRAVITY_IDE_PLATFORM = "windows/amd64";
 
 /**
- * The real Antigravity CLI User-Agent, e.g.
- * `antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)`.
+ * Real Antigravity IDE User-Agent format, decompiled from 2.5.5 Go LS (`setHeaders` @ `0x1018fbe00`):
+ * `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`
+ *
+ * Token ordering from decompiled binary: `os_type` -> `arch` -> `aidev_client` -> `auth_method=oauth`.
+ *
+ * Must be the IDE client family (`antigravity/ide/...`): Cloud Code Assist backend gates
+ * newer agent models (e.g. `gemini-3.7-flash`) by User-Agent and answers 404 NOT_FOUND to
+ * CLI-shaped UAs even with a valid OAuth token. Only `antigravity/ide/<ver>` unlocks them.
+ * The one exception is Gemini 4 Argon, which CCA serves ONLY to the CLI family; see
+ * `antigravityCliUserAgent`.
  * A `GOOGLE_ANTIGRAVITY_USER_AGENT` override (set by the caller) takes precedence upstream.
  */
-export function antigravityUserAgent(version = ANTIGRAVITY_CLI_VERSION): string {
+export function antigravityUserAgent(version = ANTIGRAVITY_IDE_VERSION, authMethod = "oauth"): string {
+  const ov = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT?.trim();
+  if (ov) return ov;
+  const [osType, arch] = ANTIGRAVITY_IDE_PLATFORM.split("/");
+  return `antigravity/ide/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
+}
+
+// ── Antigravity CLI ──
+/** Antigravity CLI version whose User-Agent CCA was verified to serve Gemini 4 Argon to. */
+export const ANTIGRAVITY_CLI_VERSION = "1.3.4";
+const ANTIGRAVITY_CLI_PLATFORM = "darwin/arm64";
+
+/**
+ * Antigravity CLI User-Agent:
+ * `antigravity/cli/${version} (os_type=${osType}; arch=${arch}; aidev_client; auth_method=oauth)`.
+ *
+ * Verified 2026-10-14 against live CCA: `gemini-4-argon-{low,medium,high}` answer only to this
+ * family and return 404 "Requested entity was not found" to the IDE UA above, while
+ * `gemini-3.7-flash-tiered` and `gemini-3.1-pro-low` 404 under this one. So it is used ONLY for
+ * Argon requests and for model discovery, never as a general replacement for the IDE UA.
+ *
+ * `GOOGLE_ANTIGRAVITY_USER_AGENT` deliberately does not apply here: that override names the IDE
+ * header, and letting it replace this one would re-lock Argon for anyone who set it.
+ */
+export function antigravityCliUserAgent(version = ANTIGRAVITY_CLI_VERSION, authMethod = "oauth"): string {
   const [osType, arch] = ANTIGRAVITY_CLI_PLATFORM.split("/");
-  return `antigravity/cli/${version} (${ANTIGRAVITY_CLI_CLIENT_NAME}; os_type=${osType}; arch=${arch})`;
+  return `antigravity/cli/${version} (os_type=${osType}; arch=${arch}; ${ANTIGRAVITY_IDE_CLIENT_NAME}; auth_method=${authMethod})`;
 }

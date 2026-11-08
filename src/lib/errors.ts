@@ -1,14 +1,66 @@
+import { formatRetryAfterAdvice, parseRetryAfterFromMessage } from "./retry-delay";
+
 export interface OcxErrorPayload {
   message: string;
   type: string;
   code: string | null;
 }
 
+export const ENCRYPTED_FUNCTION_OUTPUT_REJECTION =
+  "Encrypted function output content could not be decrypted or decoded.";
+
+/**
+ * The error identity for a send this proxy declined to make (#4708).
+ *
+ * Declared here rather than only on the error class because the classifier is what decides
+ * whether the identity survives serialization, and every dispatch path has to name the same
+ * string for a client to be able to tell this apart from a provider rate limit.
+ */
+export const SEND_BUDGET_EXHAUSTED_CODE = "request_send_budget_exhausted";
+export const SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE = "spend_ledger_storage_unavailable";
+/**
+ * Wire code for the undeclared-tool guard's deterministic refusal. Endpoint translators
+ * read it to keep the refusal non-retryable instead of folding it into the transient
+ * upstream-error class. Declared here rather than in the guard module because the shared
+ * envelope formatter decides whether the identity survives serialization.
+ */
+export const UNDECLARED_TOOL_CALL_ERROR_CODE = "undeclared_tool_call";
+
+/** First nonblank string across the canonical upstream error paths, in priority order. */
+export function upstreamErrorMessageFromPayload(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+  const json = payload as {
+    type?: unknown;
+    message?: unknown;
+    error?: { message?: unknown };
+    last_error?: { message?: unknown };
+    response?: {
+      error?: { message?: unknown };
+      incomplete_details?: { message?: unknown };
+    };
+  };
+  const messages = [json.error?.message,
+    json.last_error?.message,
+    json.response?.error?.message,
+    json.response?.incomplete_details?.message,
+    // The Responses stream error event carries a flat message (type/code/message),
+    // unlike the response.failed envelope the branches above already cover.
+    json.type === "error" ? json.message : undefined];
+  return messages.find((message): message is string => typeof message === "string" && message.trim().length > 0);
+}
+
 /** OpenAI / Codex hard block for high-risk cybersecurity activity (HTTP 400 or mid-stream). */
 export const CYBER_POLICY_ERROR_CODE = "cyber_policy";
+export const CYBER_POLICY_FALLBACK_MESSAGE = "Request blocked by the upstream cybersecurity policy.";
 
 export function isCyberPolicyCode(code: string | null | undefined): boolean {
   return code === CYBER_POLICY_ERROR_CODE;
+}
+
+/** Preserve a structured upstream error type; otherwise use the dedicated policy identity. */
+export function cyberPolicyErrorType(type: string | null | undefined): string {
+  const trimmed = typeof type === "string" ? type.trim() : "";
+  return trimmed || CYBER_POLICY_ERROR_CODE;
 }
 
 /**
@@ -30,6 +82,75 @@ export function isCyberPolicyMessage(text: string): boolean {
   return false;
 }
 
+/**
+ * Refusal codes Codex ends a turn on.
+ *
+ * Its Responses parser classifies a `response.failed` terminal by `error.code`
+ * alone (codex-rs/codex-api/src/sse/responses.rs:423-462). These four become a
+ * fatal `ApiError` the client reports instead of reconnecting. A code outside
+ * this set is never read as a refusal: `server_is_overloaded` and `slow_down`
+ * take the overload arm, `rate_limit_exceeded` takes the rate-limit arm, and
+ * everything else falls through to `ApiError::Retryable` and is reconnected up
+ * to `stream_max_retries`.
+ *
+ * Deliberately scoped to content refusals. `insufficient_quota` and
+ * `context_length_exceeded` are terminal for Codex too, but they are separate
+ * failure families this proxy already classifies through its own quota and
+ * context paths, and pulling them in here would change their retry behavior
+ * with no evidence asking for it.
+ */
+const TERMINAL_REFUSAL_CODES = new Set<string>([
+  CYBER_POLICY_ERROR_CODE,
+  "misalignment_policy_violation",
+  "invalid_prompt",
+  "bio_policy",
+]);
+
+/** True when an upstream error code is a refusal the client must not retry. */
+export function isTerminalRefusalCode(code: string | null | undefined): boolean {
+  return typeof code === "string" && TERMINAL_REFUSAL_CODES.has(code);
+}
+
+/** Stand-in copy for a refusal the upstream sent without a message of its own. */
+export const TERMINAL_REFUSAL_FALLBACK_MESSAGE = "The upstream refused this request.";
+
+/** Readable copy for a refusal code, used when the upstream carried no message. */
+export function terminalRefusalFallbackMessage(code: string): string {
+  return code === CYBER_POLICY_ERROR_CODE
+    ? CYBER_POLICY_FALLBACK_MESSAGE
+    : TERMINAL_REFUSAL_FALLBACK_MESSAGE;
+}
+
+/**
+ * Name the refusal code behind upstream safety copy when the structured code
+ * was not carried on the wire.
+ *
+ * Same discipline as {@link isCyberPolicyMessage}: whole distinctive phrases
+ * only. A loose match here is the mirror-image defect — it would end a turn
+ * that a genuine transient failure would have retried successfully — so a
+ * message that merely mentions safety or blocking does not qualify. Callers
+ * must consult this only when the upstream carried no structured code at all,
+ * so that a transport failure quoting a refusal in its diagnostic text cannot
+ * be promoted past the verdict the upstream actually gave.
+ *
+ * Copy provenance: "limited access to this content for safety reasons" is the
+ * prefix Codex itself matches (tui/src/chatwidget/turn_runtime.rs:8-15) and
+ * pairs with `invalid_prompt` in its parser fixture (sse/responses.rs:1358-1366),
+ * which also pairs "flagged for possible biological risk" with `bio_policy`.
+ * "blocked by our safety systems" is the copy reported in #5176; pairing it
+ * with `invalid_prompt` is an inference from the two verified pairings above,
+ * not something the upstream source states.
+ */
+export function safetyRefusalCodeFromMessage(text: string): string | undefined {
+  const lower = String(text ?? "").toLowerCase();
+  if (lower.includes("flagged for possible biological risk")) return "bio_policy";
+  if (
+    lower.includes("blocked by our safety systems")
+    || lower.includes("limited access to this content for safety reasons")
+  ) return "invalid_prompt";
+  return undefined;
+}
+
 function isSubscriptionGateMessage(text: string): boolean {
   return (
     text.includes("requires a subscription") ||
@@ -40,6 +161,112 @@ function isSubscriptionGateMessage(text: string): boolean {
     text.includes("pro subscription") ||
     text.includes("ollama.com/upgrade") ||
     (text.includes("upgrade") && text.includes("subscription"))
+  );
+}
+
+/**
+ * xAI (and similar Chat Completions gateways) sometimes refuse a turn with HTTP 403
+ * and a model-refusal sentence instead of 200 + finish_reason=content_filter.
+ * Codex treats that 403 as a transport failure, so the user message is never
+ * recorded as a completed turn and retries loop. Keep this allowlist narrow:
+ * entitlement / plan / model-access 403s must stay errors.
+ */
+const POLICY_REFUSAL_PHRASES = [
+  "i can't help with that request",
+  "i cannot help with that request",
+  "i'm unable to help with that request",
+  "i am unable to help with that request",
+] as const;
+
+function hasModelAccessCue(text: string): boolean {
+  return (
+    text.includes("not allowed to use this model")
+    || text.includes("not allowed to use this operation")
+  );
+}
+
+/**
+ * xAI plan and credit 403 wording. Checked only by the refusal matcher below: adding these to
+ * the global subscription classifier would also change status and error-code inference for
+ * every message-only error that happens to mention credits.
+ */
+function hasEntitlementCue(text: string): boolean {
+  return (
+    isSubscriptionGateMessage(text)
+    || text.includes("need a grok subscription")
+    || text.includes("run out of credits")
+  );
+}
+
+/** Lowercase, collapse whitespace, and strip trailing .!? so an exact phrase match is stable. */
+function normalizePolicyRefusalSentence(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+}
+
+/**
+ * True only when the extracted error sentence is exactly a known model-refusal
+ * phrase. JSON / "Provider error 403:" wrappers are unwrapped first. Extra
+ * plan, credit, entitlement, or model-access wording keeps the error path.
+ */
+export function isUpstreamPolicyRefusalMessage(text: string): boolean {
+  const extracted = extractPolicyRefusalText(text);
+  const originalLower = text.toLowerCase();
+  const extractedLower = extracted.toLowerCase();
+  if (hasEntitlementCue(originalLower) || hasEntitlementCue(extractedLower)) return false;
+  if (hasModelAccessCue(originalLower) || hasModelAccessCue(extractedLower)) return false;
+  const normalized = normalizePolicyRefusalSentence(extracted);
+  return (POLICY_REFUSAL_PHRASES as readonly string[]).includes(normalized);
+}
+
+/** HTTP 403 plus {@link isUpstreamPolicyRefusalMessage}; other statuses never rewrite. */
+export function isUpstreamPolicyRefusal(status: number, text: string): boolean {
+  return status === 403 && isUpstreamPolicyRefusalMessage(text);
+}
+
+/** Pull the human-readable refusal sentence out of a JSON or prefixed error body. */
+export function extractPolicyRefusalText(raw: string): string {
+  const trimmed = raw.trim();
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: unknown; message?: unknown };
+    const nested = parsed.error;
+    if (typeof nested === "string" && nested.trim()) return nested.trim();
+    if (nested && typeof nested === "object") {
+      const msg = (nested as { message?: unknown; error?: unknown }).message
+        ?? (nested as { error?: unknown }).error;
+      if (typeof msg === "string" && msg.trim()) return msg.trim();
+    }
+    if (typeof parsed.message === "string" && parsed.message.trim()) return parsed.message.trim();
+  } catch {
+    /* not JSON */
+  }
+  // The proxy's own error text wraps the upstream JSON (`Provider error 403: {"error": ...}`),
+  // so the remainder after the prefix gets the same unwrapping.
+  const prefixed = trimmed.match(/^Provider error 403:\s*([\s\S]+)$/i);
+  if (prefixed?.[1]?.trim()) return extractPolicyRefusalText(prefixed[1]);
+  return trimmed;
+}
+
+function isLocalAclHardeningMessage(text: string): boolean {
+  const secretPathHardening = text.includes("secret path") && (
+    text.includes("acl") ||
+    text.includes("harden") ||
+    text.includes("permission") ||
+    text.includes("access denied") ||
+    text.includes("inheritance")
+  );
+  return (
+    text.includes("icacls") ||
+    text.includes("acl hardening") ||
+    text.includes("ntfs") ||
+    secretPathHardening ||
+    text.includes("inheritance:r") ||
+    /\bwindows\b.*\bacl\b/.test(text) ||
+    text.includes("/grant:r")
   );
 }
 
@@ -84,6 +311,28 @@ function isPermissionMessage(text: string): boolean {
 }
 
 /**
+ * Geographic / network-location denials. Google's Cloud Code Assist API returns these as
+ * HTTP 400 `FAILED_PRECONDITION: User location is not supported for the API use.` — the
+ * request is well-formed, the caller's location is refused. Treated as a permission-class
+ * rejection, never as an invalid request (#3467).
+ */
+const LOCATION_UNSUPPORTED_PATTERNS = [
+  "location is not supported",
+  "location not supported",
+  "unsupported location",
+  "region is not supported",
+  "unsupported region",
+  "country is not supported",
+  "not supported in your country",
+  "not supported in your region",
+] as const;
+
+export function isLocationUnsupportedMessage(text: string): boolean {
+  const lower = text.toLowerCase();
+  return LOCATION_UNSUPPORTED_PATTERNS.some(needle => lower.includes(needle));
+}
+
+/**
  * Client cancelled / closed the turn. Matches ONLY abort phrases this codebase
  * produces — "client closed request during web-search" (src/web-search/loop.ts),
  * "Client cancelled request" (src/server/responses.ts) — plus the explicit
@@ -102,8 +351,23 @@ export function isClientClosedMessage(text: string): boolean {
   );
 }
 
+/**
+ * Ambiguous-reset refusal wording owned by this proxy (src/lib/upstream-retry.ts):
+ * the upstream exchange did not complete reliably, so the request may already have
+ * been processed and automatic replay was stopped. Matched narrowly so a
+ * provider-sent message is never relabeled by it.
+ */
+export function isUpstreamResetReplayRefusedMessage(text: string): boolean {
+  return text.toLowerCase().includes(
+    "the upstream exchange did not complete reliably. the request may already have been processed",
+  );
+}
+
 export function classifyError(status: number, type: string, message: string): OcxErrorPayload {
   const text = message.toLowerCase();
+  if (type === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) {
+    return { message, type: "server_error", code: SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE };
+  }
   if (type === "previous_response_not_found") {
     return { message, type: "invalid_request_error", code: "previous_response_not_found" };
   }
@@ -120,24 +384,49 @@ export function classifyError(status: number, type: string, message: string): Oc
     return { message, type: "invalid_request_error", code: "client_closed_request" };
   }
   // Codex only shows the dedicated cyber UI when error.code === "cyber_policy".
-  // Prefer that code (and invalid_request_error) over generic remaps / 502 upstream_server_error.
+  // The public wire does not establish invalid_request_error as the canonical type, so
+  // message-only classification keeps the dedicated identity instead of inventing one.
+  // Structured callers re-apply their real upstream type with cyberPolicyErrorType().
   if (type === CYBER_POLICY_ERROR_CODE || isCyberPolicyMessage(text)) {
-    return { message, type: "invalid_request_error", code: CYBER_POLICY_ERROR_CODE };
+    return { message, type: CYBER_POLICY_ERROR_CODE, code: CYBER_POLICY_ERROR_CODE };
+  }
+  // A LOCAL preflight refusal keeps its own code (#1524). The message necessarily says
+  // "context window" -- that is what it is refusing on -- so the generic remap below would
+  // rewrite it to `context_length_exceeded` and make it indistinguishable from an UPSTREAM
+  // verdict. The two need opposite fallback handling: ours means "this candidate does not
+  // fit", theirs means "the request is impossible", so collapsing them ended the chain at
+  // the first candidate that was merely too small.
+  if (type === "input_admission_refused") {
+    return { message, type: "invalid_request_error", code: "input_admission_refused" };
+  }
+  // A LOCAL inbound admission refusal (#3573) keeps its own code for the same reason as the
+  // preflight refusal above. #4112 gave the UPSTREAM 413 on this surface
+  // `context_length_exceeded`; without a distinct code here a client cannot tell a body the
+  // proxy never read from a turn the provider itself rejected, and only one of the two is
+  // fixed by raising `maxInboundBodyBytes`.
+  if (type === "inbound_body_too_large") {
+    return { message, type: "invalid_request_error", code: "inbound_body_too_large" };
   }
   if (
     text.includes("context_length_exceeded") ||
     text.includes("context window") ||
     text.includes("context length") ||
     text.includes("maximum context") ||
-    text.includes("too many tokens")
+    text.includes("too many tokens") ||
+    (status === 400 && /\binput token count(?:\s*\([\d,]+\))?\s+exceeds\s+the maximum number of tokens allowed\b/.test(text))
   ) {
     return { message, type: "invalid_request_error", code: "context_length_exceeded" };
   }
   // "Cursor resource limit exceeded" is emitted only for explicit request-size overflow
-  // details (isCursorRequestTooLargeDetail in cursor-errors.ts); quota-style resource
-  // exhaustion arrives as "Cursor rate limit exceeded" and falls through to 429 below.
+  // details (isCursorRequestTooLargeDetail in cursor-errors.ts); "Cursor context limit
+  // exceeded" is the bare payload-overflow shape (isCursorZeroTokenResourceExhausted);
+  // quota-style resource exhaustion arrives as "Cursor rate limit exceeded" and falls
+  // through to 429 below.
   if (text.includes("cursor resource limit exceeded")) {
     return { message, type: "invalid_request_error", code: "tool_catalog_too_large" };
+  }
+  if (text.includes("cursor context limit exceeded")) {
+    return { message, type: "invalid_request_error", code: "context_length_exceeded" };
   }
   // The Cursor adapter's classified rate-limit prefix is authoritative: its DETAIL may echo
   // quota wording ("... quota exhausted") that would otherwise hit the insufficient_quota
@@ -155,6 +444,14 @@ export function classifyError(status: number, type: string, message: string): Oc
   ) {
     return { message, type: "insufficient_quota", code: "insufficient_quota" };
   }
+  // A refusal this proxy made itself, kept apart from the provider rate limits below. The HTTP
+  // semantics are identical -- 429, do not send this again now -- but the code is the only thing
+  // that tells an operator reading a log whether the provider throttled the request or whether
+  // this process declined to send it. Folding it into the generic rate-limit code sent them to
+  // the provider's dashboard to explain a decision that was never made there.
+  if (type === SEND_BUDGET_EXHAUSTED_CODE) {
+    return { message, type: "rate_limit_error", code: SEND_BUDGET_EXHAUSTED_CODE };
+  }
   if (
     status === 429 ||
     text.includes("rate limit") ||
@@ -170,6 +467,11 @@ export function classifyError(status: number, type: string, message: string): Oc
   if (type === "origin_rejected") {
     return { message, type: "invalid_request_error", code: "origin_rejected" };
   }
+  // Local ACL setup failures can contain provider-like auth wording (for example
+  // "access denied" or "authentication") but represent unavailable infrastructure.
+  if (status === 503 && isLocalAclHardeningMessage(text)) {
+    return { message, type: "server_error", code: "upstream_server_error" };
+  }
   // HTTP 401 and explicit auth failures are authoritative even when provider text
   // also advertises an upgrade or subscription.
   if (
@@ -178,6 +480,15 @@ export function classifyError(status: number, type: string, message: string): Oc
     isAuthenticationMessage(text)
   ) {
     return { message, type: "authentication_error", code: "invalid_api_key" };
+  }
+  // An explicit permission enum must not acquire a more specific inferred reason.
+  if (type === "PERMISSION_DENIED" || text.includes("permission_denied")) {
+    return { message, type: "permission_error", code: "permission_denied" };
+  }
+  // Location denials outrank generic permission / subscription wording, but never an
+  // authoritative 5xx. Message-only adapter terminals arrive here with inferred 403.
+  if (status < 500 && (type === "location_not_supported" || isLocationUnsupportedMessage(text))) {
+    return { message, type: "permission_error", code: "location_not_supported" };
   }
   // Subscription labels are valid only in a known permission context.
   if (
@@ -247,21 +558,7 @@ export function isRateLimitOrQuotaFailureMessage(message: string): boolean {
   return normalized.toLowerCase().includes("usage limit");
 }
 
-/** Best-effort parse of a retry delay embedded in an upstream error message. */
-export function parseRetryAfterFromMessage(message: string): number | undefined {
-  const patterns = [
-    /try again in (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry after (\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i,
-    /retry[- ]after[:\s]+(\d+)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = message.match(pattern);
-    if (!match?.[1]) continue;
-    const seconds = Number.parseFloat(match[1]);
-    if (Number.isFinite(seconds) && seconds > 0) return Math.ceil(seconds);
-  }
-  return undefined;
-}
+export { parseRetryAfterFromMessage };
 
 /** Infer HTTP status from adapter terminal error text (provider-agnostic keyword matching). */
 export function inferHttpStatusFromAdapterMessage(message: string): number {
@@ -273,6 +570,7 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   // See classifyError: this prefix now only means explicit request-size overflow (400);
   // quota-style Cursor resource exhaustion carries the rate-limit prefix and maps to 429.
   if (lower.includes("cursor resource limit exceeded")) return 400;
+  if (lower.includes("cursor context limit exceeded")) return 400;
   if (
     lower.includes("resource_exhausted") ||
     lower.includes("resource exhausted") ||
@@ -280,10 +578,27 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
     lower.includes("too many requests") ||
     lower.includes("throttling")
   ) return 429;
+  // Local Windows filesystem hardening is infrastructure, not provider authentication.
+  // Keep this ahead of auth/permission and timeout keyword inference.
+  if (isLocalAclHardeningMessage(lower)) return 503;
   // Strong authentication signals win when a message contains mixed auth and
   // subscription/permission wording.
   if (isAuthenticationMessage(lower)) return 401;
+  // A location denial is a permission-class rejection; keep it aligned with the
+  // `permission_error` envelope status so message-only and classified paths agree.
+  if (isLocationUnsupportedMessage(lower)) return 403;
   if (isSubscriptionGateMessage(lower) || isPermissionMessage(lower)) return 403;
+  // Same precedence rule as classifyCursorError: an explicit gRPC FAILED_PRECONDITION is a
+  // structured, deterministic rejection, so it outranks the overload keywords that routinely
+  // appear beside it ("failed_precondition: model unavailable for this plan"). Without this,
+  // the message matched "unavailable" and returned a retryable 503, so clients kept retrying
+  // a rejection that can never succeed.
+  if (lower.includes("failed_precondition") || lower.includes("failed precondition")) return 400;
+  // Bytes the upstream itself produced and then mangled are a provider protocol failure, not a
+  // malformed client request. This must sit ahead of the generic "malformed" -> 400 branch so a
+  // combo can fail over instead of returning a terminal 4xx the caller cannot act on. Scoped to
+  // the "malformed upstream" phrase our adapters emit; plain "malformed" keeps its 400 verdict.
+  if (lower.includes("malformed upstream")) return 502;
   if (
     lower.includes("unavailable") ||
     lower.includes("overloaded") ||
@@ -327,10 +642,42 @@ export function adapterFailureFromMessage(message: string): { httpStatus: number
             : httpStatus === 400
               ? "invalid_request_error"
               : "upstream_error";
-  return {
-    httpStatus,
-    error: classifyError(httpStatus, errorType, finalMessage),
-  };
+  const error = classifyError(httpStatus, errorType, finalMessage);
+  if (httpStatus === 429 && error.type === "rate_limit_error"
+    && ["rate_limit_exceeded", "slow_down"].includes(error.code ?? "")) {
+    error.message = formatRetryAfterAdvice(message) ?? error.message;
+  }
+  return { httpStatus, error };
+}
+
+/** A declared client refusal: retrying the identical request cannot change the verdict. */
+const CLIENT_ERROR_STATUS: Record<string, 400 | 401 | 403 | 404> = {
+  invalid_request_error: 400,
+  authentication_error: 401,
+  permission_error: 403,
+  not_found_error: 404,
+};
+
+/** Narrow structured classes carried through a synthesized bare-error terminal. */
+export function recognizedUpstreamError(error: { type?: unknown; code?: unknown }):
+  { type: string; code: string; httpStatus: 400 | 401 | 403 | 404 | 429 | 503 } | undefined {
+  const code = typeof error.code === "string" ? error.code : undefined;
+  const clientClass = code ?? (typeof error.type === "string" ? error.type : undefined);
+  if (clientClass !== undefined && Object.hasOwn(CLIENT_ERROR_STATUS, clientClass)) {
+    return { type: clientClass, code: clientClass, httpStatus: CLIENT_ERROR_STATUS[clientClass] };
+  }
+  // An explicit unknown code must not gain a recognized class from its type or copy.
+  if (code !== undefined && !["rate_limit_exceeded", "rate_limit_error", "server_is_overloaded", "overloaded_error"].includes(code)) return undefined;
+  if (code === "rate_limit_exceeded" || code === "rate_limit_error"
+    || (code === undefined && error.type === "rate_limit_error")) {
+    return { type: "rate_limit_error", code: code ?? "rate_limit_exceeded", httpStatus: 429 };
+  }
+  if (code === "server_is_overloaded" || code === "overloaded_error"
+    || (code === undefined && error.type === "overloaded_error")) {
+    return { type: error.type === "overloaded_error" ? "overloaded_error" : "server_error",
+      code: code ?? "server_is_overloaded", httpStatus: 503 };
+  }
+  return undefined;
 }
 
 /** Map a terminal Responses error object to the HTTP status we record in /api/logs. */
@@ -340,9 +687,17 @@ export function httpStatusFromTerminalError(error: {
   message?: string;
 } | undefined): number {
   if (!error) return 502;
+  if (error.code === SPEND_LEDGER_STORAGE_UNAVAILABLE_CODE) return 503;
   if (error.code === "client_closed_request" || error.code === "client_cancelled") return 499;
   if (isCyberPolicyCode(error.code) || (error.message ? isCyberPolicyMessage(error.message) : false)) {
     return 400;
+  }
+  const message = error.message ?? "";
+  const recognized = recognizedUpstreamError(error);
+  // Client-closed messages often arrive as invalid_request_error after classifyError, so a
+  // recognized 400 yields to the client-closed check below; every other class keeps its order.
+  if (recognized && !(recognized.httpStatus === 400 && message && isClientClosedMessage(message))) {
+    return recognized.httpStatus;
   }
   if (error.type === "rate_limit_error" || error.code === "rate_limit_exceeded") return 429;
   if (error.type === "authentication_error" || error.code === "invalid_api_key") return 401;
@@ -355,10 +710,27 @@ export function httpStatusFromTerminalError(error: {
   if (error.type === "server_error" && error.code === "server_is_overloaded") return 503;
   // Client-closed messages often arrive as invalid_request_error after classifyError; check message
   // before treating every invalid_request_error as HTTP 400.
-  const message = error.message ?? "";
   if (message && isClientClosedMessage(message)) return 499;
   if (error.type === "invalid_request_error") return 400;
   if (error.type === "proxy_error") return 500;
-  if (message) return inferHttpStatusFromAdapterMessage(message);
+  // A structured server class must not be downgraded to a CLIENT error by message wording.
+  // classifyError assigns `server_error` + `upstream_server_error` to every 5xx it sees, so
+  // the class is authoritative about blame: the upstream failed, the caller did not send a
+  // bad request. What it is NOT authoritative about is which server status fits — a stall is
+  // genuinely 504 and an overload genuinely 503, and flattening those to 502 discards
+  // information both the log surface and the retry policy read. So message inference still
+  // chooses the specific status, and only a client-error verdict is overridden.
+  //
+  // The override is deliberately narrowed to 400 alone. 429, 499, 401 and 403 are all
+  // actionable signals the caller routes on — retry-after, client cancellation, re-auth,
+  // entitlement — and overriding them would trade one kind of misreport for another. 400 is
+  // the single verdict that both blames the caller and stops the retry, which is the failure
+  // being fixed: an upstream 500 whose text happens to contain "malformed" or "invalid
+  // request" used to return 400, so Claude Code stopped retrying a retryable failure.
+  const structuredServerClass = error.type === "server_error" || error.code === "upstream_server_error";
+  if (message) {
+    const inferred = inferHttpStatusFromAdapterMessage(message);
+    return structuredServerClass && inferred === 400 ? 502 : inferred;
+  }
   return 502;
 }

@@ -1,3 +1,6 @@
+import { OPENAI_API_RESPONSES_URL } from "./native-response-control";
+import { isInjectionRequest } from "./native-injection-protocol";
+import type { NativeResponseControl } from "./native-response-control";
 // Upstream WebSocket transport for the ChatGPT Codex backend.
 //
 // Why this exists: the Codex backend serves the responses_websockets path from
@@ -12,15 +15,127 @@
 // returned event frames as an SSE byte stream, so every downstream consumer
 // (passthrough relay, adapter parsers, usage sniffing) is unchanged.
 
-const CODEX_RESPONSES_HTTP_URL = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_RESPONSES_WS_URL = "wss://chatgpt.com/backend-api/codex/responses";
-const WS_BETA = "responses_websockets=2026-02-06";
-// If the 101 never arrives (network black hole), give SSE a chance well before
-// the caller's connect timeout (default 200s) would fire.
-const UPGRADE_DEADLINE_MS = 10_000;
+import { codexWsReuseAcrossTurnsEnabled } from "../../config/codex-ws-reuse-setting";
+import { compareBunVersions } from "../../lib/bun-stream-caps";
+import { resolveProxyRoute, socks5ProxyFromEnv } from "../../lib/proxy-env";
+import type { CodexWsQuotaObserver } from "./codex-ws-metadata";
+import { CODEX_RESPONSES_HTTP_URL, CODEX_RESPONSES_WS_URL, CODEX_WS_FRAME_HEADERS, prepareCodexHttpInit, prepareCodexWsRequest } from "./codex-ws-request";
+import { codexWsExchange } from "./codex-ws-exchange";
+import { CodexWsSession } from "./codex-ws-session";
+import { codexWsPool, codexWsReuseIdentity } from "./codex-ws-pool";
+import { codexWsCreateFrameExceedsLimit, type CodexWsPreOutputRefusalHold } from "./codex-ws-wire";
+import { isLoopbackUrl, rewriteWebSocketDial } from "../../plugins/upstream-hooks";
+import { outboundCredentials } from "../../lib/outbound-credential-registry";
+export { CODEX_WS_LIVENESS_PING_INTERVAL_MS, CODEX_WS_RESPONSE_PRELUDE_TIMEOUT_MS, MAX_CODEX_WS_FRAME_BYTES, MAX_CODEX_WS_QUEUE_BYTES,
+  MAX_CODEX_WS_CREATE_FRAME_BYTES, CODEX_WS_CREATE_FRAME_LIMIT_BYTES, codexWsCreateFrameExceedsLimit,
+  isCodexWsQuotaObservedResponse, isCodexWsUpstreamResponse, isCodexWsPreludeProjection } from "./codex-ws-wire";
+export const MIN_BOUNDED_CODEX_WS_BUN_VERSION = "1.4.0";
 
-export function shouldUseCodexWsUpstream(url: string, init?: RequestInit): boolean {
-  if (url !== CODEX_RESPONSES_HTTP_URL) return false;
+/**
+ * Dial URL for a first-party Responses endpoint. The canonical ChatGPT backend
+ * keeps its constant; the api.openai.com Responses endpoint swaps https for wss
+ * on the same path. No other upstream may enter the WebSocket lane.
+ */
+function wsUpstreamUrlFor(httpUrl: string): string {
+  if (httpUrl === CODEX_RESPONSES_HTTP_URL) return CODEX_RESPONSES_WS_URL;
+  if (httpUrl === OPENAI_API_RESPONSES_URL) return httpUrl.replace(/^http(s?):/, "ws$1:");
+  throw new Error("unsupported Codex WebSocket upstream");
+}
+export type BunRuntimeIdentity = {
+  version: string;
+  versionWithSha: string;
+};
+
+export type BunRuntimeGateInput = string | BunRuntimeIdentity;
+
+export function currentBunRuntimeIdentity(): BunRuntimeIdentity {
+  return {
+    version: Bun.version,
+    versionWithSha: Bun.version_with_sha,
+  };
+}
+
+function boundedRelayVersion(input: BunRuntimeGateInput): string | null {
+  if (typeof input === "string") return input.trim() || null;
+  const numericVersion = input.version.trim();
+  const numericMatch = /^(\d+\.\d+\.\d+)$/.exec(numericVersion);
+  const detailedMatch = /^v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\s+\([0-9a-fA-F]+\)$/.exec(
+    input.versionWithSha.trim(),
+  );
+  if (!numericMatch || !detailedMatch) return null;
+  const detailedNumeric = /^(\d+\.\d+\.\d+)/.exec(detailedMatch[1])?.[1];
+  return detailedNumeric === numericMatch[1] ? detailedMatch[1] : null;
+}
+
+/**
+ * Bun 1.3.14 does not propagate a stalled HTTP response socket back to a JS
+ * ReadableStream producer on Windows. A real raw-TCP slow-client probe drained
+ * the entire upstream despite the eager relay queue; Bun 1.4.0-canary.1 stopped
+ * below one MiB. Prereleases still fail closed; release builds before 1.4.0
+ * fall back to HTTP SSE.
+ */
+export function bunSupportsBoundedCodexWsRelay(
+  runtime: BunRuntimeGateInput = currentBunRuntimeIdentity(),
+): boolean {
+  const version = boundedRelayVersion(runtime);
+  if (!version) return false;
+  if (/^\d+\.\d+\.\d+-/.test(version.trim())) return false;
+  const comparison = compareBunVersions(version, MIN_BOUNDED_CODEX_WS_BUN_VERSION);
+  return comparison !== null && comparison >= 0;
+}
+
+/**
+ * Apply plugin rewrites to one Codex WebSocket dial and settle its proxy. `proxy` was resolved
+ * for the canonical `wsUrl`. A loopback rewrite dials directly; any other rewrite gets its own
+ * route (scheme and `NO_PROXY` may differ). Null means the rewritten destination needs the SSE
+ * fallback, exactly as an unusable route for the canonical URL does.
+ */
+export function planCodexWsDial(
+  wsUrl: string,
+  headers: Record<string, string>,
+  proxy: string | undefined,
+  env: Parameters<typeof resolveProxyRoute>[1] = process.env,
+): { url: string; headers: Record<string, string>; proxy: string | undefined } | null {
+  const rewritten = rewriteWebSocketDial(wsUrl, headers, proxy);
+  // Per-turn headers ride in each frame's client_metadata, which was prepared before the rewrite
+  // and is authoritative; a pooled socket's upgrade copy is intentionally ignored. A rewriter
+  // therefore cannot change them here, and the upgrade keeps the values the frame carries.
+  const dialHeaders = { ...rewritten.headers };
+  const reuseAcrossTurns = codexWsReuseAcrossTurnsEnabled();
+  for (const name of CODEX_WS_FRAME_HEADERS) {
+    if (reuseAcrossTurns) delete dialHeaders[name];
+    else if (Object.hasOwn(headers, name)) dialHeaders[name] = headers[name]!;
+    else delete dialHeaders[name];
+  }
+  const dial = { ...rewritten, headers: dialHeaders };
+  if (dial.url === wsUrl || isLoopbackUrl(dial.url)) return dial;
+  let destination: URL;
+  try {
+    destination = new URL(dial.url);
+  } catch {
+    return null;
+  }
+  const route = resolveProxyRoute(destination, env);
+  if (route.kind === "fallback") return null;
+  return { ...dial, proxy: route.kind === "proxy" ? route.proxy : undefined };
+}
+
+export function shouldUseCodexWsUpstream(
+  url: string,
+  init?: RequestInit,
+  runtime: BunRuntimeGateInput = currentBunRuntimeIdentity(),
+  upstreamWebsocketConfigured?: boolean,
+): boolean {
+  if (!bunSupportsBoundedCodexWsRelay(runtime)) return false;
+  if (socks5ProxyFromEnv()) return false;
+  if (url === CODEX_RESPONSES_HTTP_URL && upstreamWebsocketConfigured === false) return false;
+  // Bun's client WebSocket API delivers only fully assembled messages and has
+  // no enforceable inbound payload limit. Keep arbitrary provider endpoints on
+  // bounded HTTP/SSE until the client can reject fragmented text and binary
+  // messages during ingestion rather than after allocation. The first-party
+  // api.openai.com lane still requires the operator opt-in.
+  if (url !== CODEX_RESPONSES_HTTP_URL
+    && !(upstreamWebsocketConfigured && url === OPENAI_API_RESPONSES_URL)) return false;
   if ((init?.method ?? "GET").toUpperCase() !== "POST") return false;
   const body = init?.body;
   if (typeof body !== "string") return false;
@@ -37,163 +152,105 @@ export function shouldUseCodexWsUpstream(url: string, init?: RequestInit): boole
   }
 }
 
-export function codexWsUpstreamFetch(
+/** Select the bounded WS lane or HTTP fallback, forwarding receipts at physical dispatch. */
+export async function codexWsUpstreamFetch(
   url: string,
   init: RequestInit,
   sseFallback: typeof globalThis.fetch,
+  runtime: BunRuntimeGateInput = currentBunRuntimeIdentity(),
+  onQuota?: CodexWsQuotaObserver,
+  beforeDispatch?: (headers: Headers) => void,
+  nativeControl?: NativeResponseControl,
+  beforeContinuation?: () => Promise<void>,
+  onPhysicalDispatch?: () => void,
+  /** Opt-in pre-output refusal hold (#6969); see codexWsExchange. */
+  preOutputRefusalHold?: CodexWsPreOutputRefusalHold,
 ): Promise<Response> {
+  const prepared = prepareCodexWsRequest(url, init);
+  if (!prepared) return sseFallback(url, prepareCodexHttpInit(url, init));
+  init = prepared.httpInit;
+  if ((url !== CODEX_RESPONSES_HTTP_URL && url !== OPENAI_API_RESPONSES_URL)
+    || !bunSupportsBoundedCodexWsRelay(runtime)) {
+    return sseFallback(url, init);
+  }
   const signal = init.signal ?? undefined;
   if (signal?.aborted) {
     return Promise.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
   }
 
-  let frameText: string;
-  try {
-    const body = JSON.parse(init.body as string) as Record<string, unknown>;
-    // The WS create frame is implicitly streaming; the backend rejects the
-    // HTTP-only `stream` flag inside a frame.
-    delete body.stream;
-    frameText = JSON.stringify({ ...body, type: "response.create" });
-  } catch {
+  const { frameText, headers } = prepared;
+  // Never infer backend support from a model name or enable controls on a gateway.
+  const control = nativeControl?.kind === "injection"
+    ? ((prepared.canonical || url === OPENAI_API_RESPONSES_URL) && isInjectionRequest(JSON.parse(frameText)) ? nativeControl : undefined)
+    : prepared.canonical ? nativeControl : undefined;
+  if (control?.kind === "injection" && url === OPENAI_API_RESPONSES_URL) {
+    const beta = headers["openai-beta"];
+    if (!beta?.split(",").some(value => value.trim() === "responses_multi_agent=v1")) {
+      headers["openai-beta"] = beta ? `${beta}, responses_multi_agent=v1` : "responses_multi_agent=v1";
+    }
+  }
+
+
+  // Decide before dialing. Once the socket is open the caller already holds a
+  // streaming Response, so the oversized close can only be surfaced as a stream
+  // error — and a resend at that point could double-generate. Measuring the
+  // frame we are about to send keeps the whole failure mode unreachable.
+  if (codexWsCreateFrameExceedsLimit(frameText)) {
     return sseFallback(url, init);
   }
 
-  const headers: Record<string, string> = {};
-  new Headers(init.headers ?? {}).forEach((value, key) => {
-    // HTTP-body framing headers do not apply to a WS handshake.
-    if (key === "content-type" || key === "content-length" || key === "accept" || key === "accept-encoding") return;
-    headers[key] = value;
-  });
-  headers["openai-beta"] = headers["openai-beta"]
-    ? headers["openai-beta"].includes("responses_websockets")
-      ? headers["openai-beta"]
-      : `${headers["openai-beta"]}, ${WS_BETA}`
-    : WS_BETA;
+  const wsUrl = wsUpstreamUrlFor(url);
+  const proxyRoute = resolveProxyRoute(new URL(wsUrl));
+  if (proxyRoute.kind === "fallback") return sseFallback(url, init);
+  const proxy = proxyRoute.kind === "proxy" ? proxyRoute.proxy : undefined;
   // A genuine caller `originator` is already in these headers via the forward
   // set. Never fabricate one here: pool/forward traffic must not impersonate
   // Codex CLI, per the metadata-integrity contract. (The backend's fast lane
   // keys on WS + originator, so callers without the tag simply keep their own
   // provenance and scheduling.)
 
-  return new Promise<Response>((resolve, reject) => {
-    let ws: WebSocket;
-    try {
-      // Bun accepts per-handshake headers; the DOM lib types only list protocol arrays.
-      ws = new WebSocket(CODEX_RESPONSES_WS_URL, { headers } as unknown as string[]);
-    } catch {
-      resolve(sseFallback(url, init));
-      return;
+  // A local refusal is not a failed upgrade and must never enter the SSE fallback path.
+  try {
+    beforeDispatch?.(new Headers(headers));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  let session: CodexWsSession;
+  try {
+    // Steering keeps a private physical connection across successor responses; it
+    // must never enter the idle-socket pool or move to a different credential.
+    // Plugin rewrite runs per exchange, before the pool lookup. The dialled destination, its
+    // headers and its proxy are all part of the reuse identity, so a pooled socket is never
+    // reused for a different destination or with stale plugin headers.
+    const dial = planCodexWsDial(wsUrl, headers, proxy);
+    if (!dial) return sseFallback(url, init);
+    // The final dial headers, after plugin rewrites, are what the WebSocket upstream receives; the
+    // per-turn headers planning drops from the upgrade still reach it inside the frame metadata.
+    outboundCredentials().remember(headers);
+    outboundCredentials().remember(dial.headers);
+    const identity = control ? null : codexWsReuseIdentity(url, dial.headers, frameText, dial.proxy, dial.url);
+    const reuseAcrossTurns = identity !== null && codexWsReuseAcrossTurnsEnabled();
+    const pooled = identity
+      ? reuseAcrossTurns
+        ? await codexWsPool.acquireWaiting(identity, dial.url, dial.headers, dial.proxy, signal)
+        : codexWsPool.acquire(identity, dial.url, dial.headers, dial.proxy)
+      : null;
+    if (reuseAcrossTurns && signal?.aborted) {
+      return Promise.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
     }
-
-    let opened = false;
-    let settledPreOpen = false;
-    let terminal = false;
-    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
-    const encoder = new TextEncoder();
-
-    const upgradeTimer = setTimeout(() => {
-      if (opened || settledPreOpen) return;
-      settledPreOpen = true;
-      try { ws.close(); } catch { /* already closing */ }
-      resolve(sseFallback(url, init));
-    }, UPGRADE_DEADLINE_MS);
-
-    const onAbort = () => {
-      if (!opened) {
-        if (settledPreOpen) return;
-        // Settle BEFORE close(): the close handler treats a pre-open close as
-        // an upgrade rejection and would dial the SSE fallback for a request
-        // the caller just cancelled.
-        settledPreOpen = true;
-        clearTimeout(upgradeTimer);
-        try { ws.close(); } catch { /* already closing */ }
-        reject(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError"));
-        return;
-      }
-      try { ws.close(); } catch { /* already closing */ }
-      if (controller && !terminal) {
-        terminal = true;
-        // Mirror an aborted fetch: the body read rejects with the abort reason.
-        try { controller.error(signal?.reason ?? new DOMException("The operation was aborted.", "AbortError")); } catch { /* stream already done */ }
-      }
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-
-    ws.addEventListener("open", () => {
-      if (settledPreOpen) return;
-      clearTimeout(upgradeTimer);
-      try {
-        ws.send(frameText);
-      } catch {
-        // send() throwing means the frame never left, so no upstream turn
-        // started and the SSE resend cannot double-generate. Falling back
-        // (instead of erroring a synthetic 200 body) keeps the pre-stream
-        // HTTP error/refresh/failover machinery in charge.
-        settledPreOpen = true;
-        try { ws.close(); } catch { /* already closing */ }
-        resolve(sseFallback(url, init));
-        return;
-      }
-      opened = true;
-      const stream = new ReadableStream<Uint8Array>({
-        start(c) { controller = c; },
-        cancel() { try { ws.close(); } catch { /* already closing */ } },
-      });
-      resolve(new Response(stream, {
-        status: 200,
-        // The 101 response headers (x-codex-*-reset-at quota hints) are not
-        // exposed by Bun's WebSocket; the periodic quota poller covers those.
-        headers: { "content-type": "text/event-stream; charset=utf-8" },
-      }));
-    });
-
-    ws.addEventListener("message", (event) => {
-      if (!controller || terminal) return;
-      const text = typeof event.data === "string" ? event.data : "";
-      if (!text) return;
-      let type: unknown;
-      try { type = (JSON.parse(text) as { type?: unknown }).type; } catch { return; }
-      if (typeof type !== "string") return;
-      // Relay only the event surface the SSE path produces today. WS-only
-      // frames (codex.rate_limits, responsesapi.websocket_timing) are dropped
-      // so downstream clients see exactly the stream shape they always got.
-      if (!type.startsWith("response.") && type !== "error") return;
-      try {
-        controller.enqueue(encoder.encode(`event: ${type}\ndata: ${text}\n\n`));
-      } catch {
-        return;
-      }
-      if (type === "response.completed" || type === "response.failed" || type === "response.incomplete" || type === "error") {
-        terminal = true;
-        try { controller.close(); } catch { /* already closed */ }
-        try { ws.close(); } catch { /* already closing */ }
-      }
-    });
-
-    ws.addEventListener("close", () => {
-      signal?.removeEventListener("abort", onAbort);
-      if (!opened) {
-        if (settledPreOpen) return;
-        settledPreOpen = true;
-        clearTimeout(upgradeTimer);
-        // Upgrade rejected (401/403/429/5xx). Retry over plain SSE so the real
-        // HTTP status reaches the existing refresh/rotation handlers. No turn
-        // started upstream, so the resend cannot double-generate.
-        resolve(sseFallback(url, init));
-        return;
-      }
-      if (controller && !terminal) {
-        terminal = true;
-        // Connection dropped before a Responses terminal event. A clean EOF
-        // here would reach clients with no response.completed/failed at all —
-        // relaySseWithFailedTail() only synthesizes a failed terminal when the
-        // body read THROWS. Error the stream like a reset TCP socket.
-        try { controller.error(new Error("codex websocket closed before a Responses terminal event")); } catch { /* stream already done */ }
-      }
-    });
-
-    ws.addEventListener("error", () => {
-      /* Bun always follows error with close; the close handler settles. */
-    });
+    session = pooled ?? new CodexWsSession(dial.url, dial.headers, false, undefined, dial.proxy);
+    if (!session.busy && !session.reserve()) {
+      session.dispose();
+      return sseFallback(url, init);
+    }
+  } catch {
+    return sseFallback(url, init);
+  }
+  return codexWsExchange({
+    session, url, init, prepared, sseFallback, onQuota, beforeDispatch,
+    nativeControl: control,
+    beforeContinuation, onPhysicalDispatch,
+    preOutputRefusalHold,
+    bunVersion: typeof runtime === "string" ? runtime : runtime.version,
   });
 }

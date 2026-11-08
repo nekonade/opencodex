@@ -22,6 +22,16 @@ describe("i18n locale contracts", () => {
     }
   });
 
+  test("Vietnamese locale is registered", () => {
+    expect(LOCALES.some(locale => locale.code === "vi")).toBe(true);
+    expect(DICTS.vi["lang.nativeName"]).toBe("Tiếng Việt");
+  });
+
+  test("Brazilian Portuguese locale is registered", () => {
+    expect(LOCALES.find(locale => locale.code === "pt")?.htmlLang).toBe("pt-BR");
+    expect(DICTS.pt["lang.nativeName"]).toBe("Português");
+  });
+
   test("every locale has a catalog-backed display name", () => {
     for (const { code } of LOCALES) {
       const displayName = DICTS[code]["lang.nativeName"];
@@ -73,6 +83,18 @@ describe("i18n locale contracts", () => {
     }
 
     expect(mismatches).toEqual([]);
+  });
+
+  test("stored-key reveal notice preserves pairing and trusted Tailscale authorization", () => {
+    const key = "api.key.revealDenied";
+    const missingTailscale = LOCALES
+      .filter(({ code }) => !DICTS[code][key].includes("Tailscale"))
+      .map(({ code }) => code);
+
+    expect(missingTailscale).toEqual([]);
+    expect(en[key]).toContain("operator-authorized session");
+    expect(en[key]).toContain("Pair this browser");
+    expect(en[key]).toContain("trusted Tailscale identity");
   });
 
   test("locale source files contain no duplicate dictionary keys", async () => {
@@ -161,6 +183,31 @@ describe("i18n locale contracts", () => {
     }
   });
 
+  test("detectInitial maps French regional navigator locales to French", () => {
+    const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+    const originalStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+
+    try {
+      Object.defineProperty(globalThis, "localStorage", {
+        value: { getItem: () => null },
+        configurable: true,
+      });
+
+      for (const language of ["fr", "fr-FR", "fr-CA", "fr-BE", "fr-CH"]) {
+        Object.defineProperty(globalThis, "navigator", {
+          value: { language },
+          configurable: true,
+        });
+        expect(detectInitial()).toBe("fr");
+      }
+    } finally {
+      if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+      else Reflect.deleteProperty(globalThis, "navigator");
+      if (originalStorage) Object.defineProperty(globalThis, "localStorage", originalStorage);
+      else Reflect.deleteProperty(globalThis, "localStorage");
+    }
+  });
+
   test("detectInitial recognizes every supported stored locale", () => {
     const originalStorage = Object.getOwnPropertyDescriptor(
       globalThis,
@@ -197,4 +244,19 @@ describe("i18n locale contracts", () => {
       }
     }
   });
+});
+
+test("Portuguese status, reference time, home navigation and Remote Link roles retain their meaning", () => {
+  expect(DICTS.pt["pws.allSystemsOk"]).toBe("Tudo funcionando normalmente");
+  expect(DICTS.pt["lab.col.asOf"]).toBe("Data de referência");
+  expect(DICTS.pt["nav.goHome"]).toBe("Ir para o painel");
+  for (const key of ["compactionRouting.comboWarning", "compactionRouting.comboWarningScoped"] as const) {
+    expect(DICTS.pt[key]).toContain("um ou mais provedores de destino podem receber a conversa");
+    expect(DICTS.pt[key]).toContain("pode repetir");
+  }
+  for (const prefix of ["link", "remoteLink"] as const) {
+    expect(DICTS.pt[`${prefix}.role.home`]).toBe("Home");
+    expect(DICTS.pt[`${prefix}.role.child`]).toBe("Child");
+  }
+  for (const value of Object.values(DICTS.pt)) expect(value).not.toMatch(/\\["']/);
 });

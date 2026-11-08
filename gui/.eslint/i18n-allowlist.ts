@@ -46,6 +46,7 @@ const TECHNICAL_UNITS = new Set([
   "Mo",
   "Mi",
   "Fr",
+  "HTTP",
   // IEC binary unit rendered next to a formatted number; a unit symbol, not UI prose.
   "GiB",
 ]);
@@ -57,6 +58,9 @@ export function isTechnicalLiteral(value: string): boolean {
 
   // Version prefix / unit tokens
   if (TECHNICAL_UNITS.has(trimmed)) return true;
+
+  // Internal Models session-cache suffix, never rendered as user-facing copy.
+  if (trimmed === ":picker-order") return true;
 
   // Absolute/relative URLs and localhost endpoints
   if (/^https?:\/\//i.test(trimmed)) return true;
@@ -97,7 +101,8 @@ export function isTechnicalLiteral(value: string): boolean {
   if (/^ocx\b/i.test(trimmed)) return true;
   if (/^codex\b/i.test(trimmed)) return true;
 
-  // HTTP headers / auth schemes
+  // HTTP protocol / headers / auth schemes
+  if (/^HTTP$/i.test(trimmed)) return true;
   if (/^Authorization\b/i.test(trimmed)) return true;
   if (/^Bearer\b/i.test(trimmed)) return true;
   if (/^Content-Type\b/i.test(trimmed)) return true;

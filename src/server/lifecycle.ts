@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { flushAntigravityReplay } from "../adapters/google-antigravity-replay";
 import { flushResponseState } from "../responses/state";
 import { setStorageCleanupPolicyLiveSink } from "../storage/policy";
@@ -7,7 +8,7 @@ import {
 } from "../storage/policy-job";
 import { abortRestoreTrashJobAsync } from "../storage/restore-job";
 import { stopStorageCleanupScheduler } from "../storage/policy-scheduler";
-import { stopLabAutomationScheduler, requestLabAutomationShutdown } from "../lab/automation/orchestrator";
+import { runDrainStartHooks, runOptionalShutdownHooks } from "../lib/optional-shutdown-hooks";
 import { stopStateStoreSweeper } from "../lib/state-store-sweeper";
 import {
   cancelQueuedStorageWorkerSpawns,
@@ -30,14 +31,23 @@ import { releaseNativeMainStartupLifecycle } from "../codex/native-profile-start
 // ---------------------------------------------------------------------------
 
 export const MAX_ACTIVE_TURNS = 256;
+export const MAX_ACTIVE_SESSION_LANES = 64;
+export const SESSION_LANE_ID_BYTES = 32;
 const turnGate = createAdmissionGate("active_turns", MAX_ACTIVE_TURNS);
 export interface ActiveTurnLease extends AdmissionLease {
+  attach(lease: AdmissionLease): void;
+  bindAbortSignal(signal: AbortSignal): () => void;
   bindAbortController(ac: AbortController): void;
+  unbindAbortController(ac: AbortController): void;
   beginCodexAccountSelection(): CodexAccountSelectionAdmission;
   isTransferred(): boolean;
 }
 const activeTurns = new Map<AbortController, ActiveTurnLease>();
 const admittedTurns = new Set<ActiveTurnLease>();
+const activeSessionLaneRefCounts = new Map<string, number>();
+let sessionLanePeak = 0;
+let sessionLaneAdmitted = 0;
+let sessionLaneRejected = 0;
 const knownTurnControllers = new WeakSet<AbortController>();
 let turnReleaseMisses = 0;
 let shutdownDraining = false;
@@ -149,6 +159,10 @@ export function resetLifecycleDrainStateForTests(): void {
   temporaryDrainOwners.clear();
   nativeMainDrainOwners.clear();
   nativeMainTurns.clear();
+  activeSessionLaneRefCounts.clear();
+  sessionLanePeak = 0;
+  sessionLaneAdmitted = 0;
+  sessionLaneRejected = 0;
   nativeMainSelections = 0;
   for (const resolve of temporaryDrainWaiters) resolve();
   temporaryDrainWaiters.clear();
@@ -157,31 +171,84 @@ export function resetLifecycleDrainStateForTests(): void {
   serverStartupReleaseFlights = new WeakMap<ReturnType<typeof Bun.serve>, Promise<void>>();
   releaseServerStartupLifecycleImpl = releaseNativeMainStartupLifecycle;
 }
-export function tryAdmitTurn(): ActiveTurnLease | null {
+export function tryAdmitTurn(sessionLaneId?: string, clientSignal?: AbortSignal): ActiveTurnLease | null {
   if (isDraining()) return null;
+  const opaqueSessionLaneId = sessionLaneId
+    ? createHash("sha256").update(sessionLaneId).digest("hex").slice(0, SESSION_LANE_ID_BYTES)
+    : undefined;
+  const sessionLaneRefCount = opaqueSessionLaneId
+    ? activeSessionLaneRefCounts.get(opaqueSessionLaneId) ?? 0
+    : 0;
+  if (opaqueSessionLaneId && sessionLaneRefCount === 0 && activeSessionLaneRefCounts.size >= MAX_ACTIVE_SESSION_LANES) {
+    sessionLaneRejected += 1;
+    return null;
+  }
   const gateLease = turnGate.tryAcquire();
   if (!gateLease) return null;
+  if (opaqueSessionLaneId) {
+    activeSessionLaneRefCounts.set(opaqueSessionLaneId, sessionLaneRefCount + 1);
+    if (sessionLaneRefCount === 0) {
+      sessionLaneAdmitted += 1;
+      sessionLanePeak = Math.max(sessionLanePeak, activeSessionLaneRefCounts.size);
+    }
+  }
   const controllers = new Set<AbortController>();
+  const attachedLeases = new Set<AdmissionLease>();
+  const abortListeners = new Map<AbortSignal, () => void>();
+  let cancellationReason: unknown;
   let active = true;
   let transferred = false;
   let nativeMainClaimed = false;
   const lease: ActiveTurnLease = {
+    attach(attachedLease) {
+      if (!active) attachedLease.release();
+      else attachedLeases.add(attachedLease);
+    },
+    bindAbortSignal(signal) {
+      if (!active || abortListeners.has(signal)) return () => {};
+      const onAbort = () => {
+        cancellationReason = signal.reason;
+        const boundControllers = [...controllers];
+        lease.release();
+        for (const controller of boundControllers) controller.abort(cancellationReason);
+      };
+      abortListeners.set(signal, onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      return () => {
+        if (abortListeners.get(signal) !== onAbort) return;
+        signal.removeEventListener("abort", onAbort);
+        abortListeners.delete(signal);
+      };
+    },
     bindAbortController(ac) {
       knownTurnControllers.add(ac);
       if (!active) {
-        ac.abort(new Error("turn already settled"));
+        ac.abort(cancellationReason ?? new Error("turn already settled"));
         return;
       }
       transferred = true;
       controllers.add(ac);
       activeTurns.set(ac, lease);
+      lease.bindAbortSignal(ac.signal);
+    },
+    unbindAbortController(ac) {
+      if (!controllers.delete(ac)) return;
+      if (activeTurns.get(ac) === lease) activeTurns.delete(ac);
+      const listener = abortListeners.get(ac.signal);
+      if (listener) {
+        ac.signal.removeEventListener("abort", listener);
+        abortListeners.delete(ac.signal);
+      }
+      // A completed child relay cannot retire its still-running parent turn.
+      if (controllers.size === 0) lease.release();
     },
     beginCodexAccountSelection() {
       const mainProfileDraining = nativeMainDrainOwners.size > 0;
-      let selectionActive = !mainProfileDraining;
+      let selectionActive = active && !mainProfileDraining;
       let released = false;
       if (selectionActive) nativeMainSelections += 1;
-      return {
+      const selection: CodexAccountSelectionAdmission = {
         mainProfileDraining,
         claimMainProfile() {
           if (released || mainProfileDraining || !active) return false;
@@ -194,27 +261,42 @@ export function tryAdmitTurn(): ActiveTurnLease | null {
         release() {
           if (released) return;
           released = true;
+          attachedLeases.delete(selection);
           if (selectionActive) {
             selectionActive = false;
             nativeMainSelections = Math.max(0, nativeMainSelections - 1);
           }
         },
       };
+      lease.attach(selection);
+      return selection;
     },
     isTransferred() { return transferred; },
     release() {
       if (!active) return;
       active = false;
       admittedTurns.delete(lease);
+      for (const [signal, listener] of abortListeners) signal.removeEventListener("abort", listener);
+      abortListeners.clear();
       for (const controller of controllers) {
         if (activeTurns.get(controller) === lease) activeTurns.delete(controller);
       }
       controllers.clear();
+      for (const attachedLease of attachedLeases) attachedLease.release();
+      attachedLeases.clear();
       nativeMainTurns.delete(lease);
+      if (opaqueSessionLaneId) {
+        const currentRefCount = activeSessionLaneRefCounts.get(opaqueSessionLaneId);
+        if (currentRefCount === 1) activeSessionLaneRefCounts.delete(opaqueSessionLaneId);
+        else if (currentRefCount && currentRefCount > 1) {
+          activeSessionLaneRefCounts.set(opaqueSessionLaneId, currentRefCount - 1);
+        }
+      }
       gateLease.release();
     },
   };
   admittedTurns.add(lease);
+  if (clientSignal) lease.bindAbortSignal(clientSignal);
   return lease;
 }
 export function codexAccountSelectionForTurn(
@@ -257,10 +339,26 @@ export function unregisterTurn(ac: AbortController): void {
     turnReleaseMisses += 1;
     return;
   }
-  lease.release();
+  lease.unbindAbortController(ac);
 }
 export function isDraining(): boolean { return shutdownDraining || temporaryDrainOwners.size > 0; }
 export function getActiveTurnCount(): number { return turnGate.metrics().active; }
+export interface SessionLaneMetrics {
+  active: number;
+  peak: number;
+  admitted: number;
+  rejected: number;
+  retainedBytes: number;
+}
+export function sessionLaneMetrics(): SessionLaneMetrics {
+  return {
+    active: activeSessionLaneRefCounts.size,
+    peak: sessionLanePeak,
+    admitted: sessionLaneAdmitted,
+    rejected: sessionLaneRejected,
+    retainedBytes: activeSessionLaneRefCounts.size * SESSION_LANE_ID_BYTES,
+  };
+}
 export function getNativeMainProfileRequestCount(): number {
   return nativeMainSelections + nativeMainTurns.size;
 }
@@ -306,23 +404,22 @@ export function getServerListenPort(): number | undefined {
  *   caller sees the same result before a replacement binds the port. Swallowing it would let
  *   `drainAndShutdown` report success while a socket is still held.
  *
- * `always` runs after the listeners regardless of their outcome, and its own failure joins the
- * reported set rather than replacing it.
+ * `always` runs after the listeners regardless of their outcome and receives whether every
+ * listener stop succeeded. Its own failure joins the reported set rather than replacing it.
  */
 export async function runListenerShutdown(
   steps: Array<() => Promise<void>>,
-  always: () => Promise<void>,
+  always: (listenersStopped: boolean) => Promise<void>,
 ): Promise<void> {
   const failures: unknown[] = [];
-  for (const step of steps) {
-    try {
-      await step();
-    } catch (error) {
-      failures.push(error);
-    }
+  // Close admission and start connection-owner cleanup before waiting for any drain.
+  // A graceful listener stop can itself depend on a later owner closing its sockets.
+  const results = await Promise.allSettled(steps.map(async step => { await step(); }));
+  for (const result of results) {
+    if (result.status === "rejected") failures.push(result.reason);
   }
   try {
-    await always();
+    await always(failures.length === 0);
   } catch (error) {
     failures.push(error);
   }
@@ -407,12 +504,14 @@ export function trackStreamLifetime(
 export async function drainAndShutdown(
   server: ReturnType<typeof Bun.serve> | undefined,
   timeoutMs: number,
-): Promise<void> {
+): Promise<boolean> {
   const s = server ?? _serverRef;
+  let shutdownSucceeded = true;
   // One absolute budget covers both a pre-existing scoped profile drain and
   // ordinary in-flight turns. A stuck scoped owner must not pin shutdown forever.
   const deadline = Date.now() + Math.max(0, timeoutMs);
   beginShutdownDrain();
+  runDrainStartHooks();
   const temporaryDrainsSettled = await waitForTemporaryDrainsUntil(deadline);
   if (!temporaryDrainsSettled) {
     console.warn("Temporary drain lease did not settle before the shutdown deadline; forcing shutdown");
@@ -420,7 +519,7 @@ export async function drainAndShutdown(
   beginBackgroundShellShutdown();
   try {
     while (admittedTurns.size > 0 && Date.now() < deadline) {
-      await Bun.sleep(100);
+      await Bun.sleep(Math.min(100, Math.max(0, deadline - Date.now())));
     }
     if (admittedTurns.size > 0) {
       console.warn(`⚠️  Aborting ${admittedTurns.size} in-flight turn(s) after ${timeoutMs}ms deadline`);
@@ -440,9 +539,11 @@ export async function drainAndShutdown(
     // shutdown is usually part of.
     const stateFlush = await Promise.allSettled([flushResponseState(), flushAntigravityReplay()]);
     if (stateFlush[0]?.status === "rejected") {
+      shutdownSucceeded = false;
       console.warn("[responses] state flush during shutdown failed");
     }
     if (stateFlush[1]?.status === "rejected") {
+      shutdownSucceeded = false;
       console.warn("[antigravity] replay flush during shutdown failed");
     }
 
@@ -452,8 +553,10 @@ export async function drainAndShutdown(
     // Abort each job independently so one wedged join cannot skip the other,
     // then drain leftovers; failures must not prevent `server.stop`.
     stopStorageCleanupScheduler();
-    requestLabAutomationShutdown();
-    stopLabAutomationScheduler();
+    // Optional subsystems (Compatibility Lab today, anything added later) tear themselves
+    // down through hooks registered at activation. A process that never activated one runs
+    // nothing here and never loads its module graph.
+    runOptionalShutdownHooks();
     stopStateStoreSweeper();
     // The overlay reconciler is owner-scoped: the startServer stop override
     // releases THIS server's lease through runListenerShutdown →
@@ -493,4 +596,5 @@ export async function drainAndShutdown(
       // never resume admission merely because shutdown cleanup returned.
     }
   }
+  return shutdownSucceeded;
 }

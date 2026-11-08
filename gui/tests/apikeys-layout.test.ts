@@ -25,7 +25,7 @@ test("ApiKeys uses workspace shell (no classic layout toggle)", async () => {
   // ApiKeys is no longer rendered by App directly: WP5 made it one panel of
   // the Integrations tab strip, which is what passes `active` so a hidden
   // panel stops polling while its drafts stay mounted.
-  expect(app).toContain("<Integrations apiBase={API_BASE} />");
+  expect(app).toContain('<Integrations apiBase={sharedBase} machineApiBase={machineBase} connected={targets.connected} />');
   expect(app).not.toContain("<ApiKeys apiBase");
   const integrations = await Bun.file(new URL("../src/pages/Integrations.tsx", import.meta.url)).text();
   expect(integrations).toContain("<ApiKeys apiBase={apiBase} active={active} />");
@@ -111,7 +111,7 @@ test("every locale has exactly the English api namespace", () => {
   // that had seventy-four. It passed while five locales were missing the same
   // key. Compare the loaded dictionaries instead: this catches missing AND
   // extra keys, in all six files, without searching source text.
-  const locales: Locale[] = ["en", "de", "ja", "ko", "ru", "zh", "zh-TW"];
+  const locales: Locale[] = ["en", "de", "fr", "ja", "ko", "ru", "zh", "zh-TW"];
   const englishApiKeys = Object.keys(DICTS.en).filter(key => key.startsWith("api.")).sort();
 
   // Activation guard: swapping the extraction back to a curated subset fails.

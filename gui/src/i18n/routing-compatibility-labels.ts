@@ -23,6 +23,11 @@ export const ROUTING_COMPATIBILITY_FIELD_LABELS: Record<Locale, CompatibilityFie
     unknownEvidence: "Unbekannte Evidenz",
     degradedEvidence: "Eingeschränkte Evidenz",
   },
+  fr: {
+    maxEvidenceAgeMs: "Âge maximal des preuves (ms)",
+    unknownEvidence: "Preuves inconnues",
+    degradedEvidence: "Preuves dégradées",
+  },
   ko: {
     maxEvidenceAgeMs: "최대 증거 유효 기간 (ms)",
     unknownEvidence: "알 수 없는 증거",
@@ -52,5 +57,15 @@ export const ROUTING_COMPATIBILITY_FIELD_LABELS: Record<Locale, CompatibilityFie
     maxEvidenceAgeMs: "Maksimum kanıt yaşı (ms)",
     unknownEvidence: "Bilinmeyen kanıt",
     degradedEvidence: "Bozulmuş kanıt",
+  },
+  vi: {
+    maxEvidenceAgeMs: "Tuổi bằng chứng tối đa (ms)",
+    unknownEvidence: "Bằng chứng không xác định",
+    degradedEvidence: "Bằng chứng bị suy giảm",
+  },
+  pt: {
+    maxEvidenceAgeMs: "Idade máxima da evidência (ms)",
+    unknownEvidence: "Evidência desconhecida",
+    degradedEvidence: "Evidência degradada",
   },
 };

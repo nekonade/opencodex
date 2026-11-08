@@ -2,7 +2,7 @@
  * Best-effort chat/session correlation for Logs / usage.jsonl (#330).
  * Opaque ids only — never persist raw emails or Claude Desktop system-hash fallbacks.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /** Reject absurdly long client strings before hashing (DoS / JSONL bloat). */
 export const LOG_CONVERSATION_ID_INPUT_MAX = 4096;
@@ -37,6 +37,47 @@ export function normalizeLogConversationId(raw: string | undefined | null): stri
   return createHash("sha256").update(trimmed).digest("hex").slice(0, LOG_CONVERSATION_ID_LEN);
 }
 
+const CODEX_THREAD_LINK_PREFIX = "codex://threads/";
+/** Real thread links stay well under this bound; larger pastes skip unwrapping so per-row matching stays cheap. */
+const LOG_CONVERSATION_LINK_MAX = 512;
+
+/**
+ * Unwrap a pasted `codex://threads/<id>` deep link to the bare thread id. Codex's
+ * "copy session link" clipboard carries that URI form while clients send the bare id
+ * on the wire, so Logs search accepts either paste without changing what is persisted.
+ * Query/fragment metadata (e.g. `?hostId=…`) belongs to the link, not the id, and is
+ * dropped. The scan is a bounded linear walk — no ambiguous regex — because this runs
+ * per log row on every filter evaluation.
+ */
+export function unwrapLogConversationQuery(query: string): string {
+  const trimmed = query.trim();
+  if (
+    trimmed.length > LOG_CONVERSATION_LINK_MAX ||
+    trimmed.length <= CODEX_THREAD_LINK_PREFIX.length ||
+    !trimmed.toLowerCase().startsWith(CODEX_THREAD_LINK_PREFIX)
+  ) {
+    return trimmed;
+  }
+  const rest = trimmed.slice(CODEX_THREAD_LINK_PREFIX.length);
+  const metaIndex = rest.search(/[?#]/);
+  const segment = (metaIndex === -1 ? rest : rest.slice(0, metaIndex)).replace(/\/+$/, "");
+  // A thread id is a single path segment; deeper paths or embedded whitespace keep the
+  // whole paste as the query, so foreign `codex://` URIs still fail to match.
+  return segment !== "" && !/[/\s]/.test(segment) ? segment : trimmed;
+}
+
+/**
+ * The candidate ids a conversation query may legitimately match. Unwrapping a pasted
+ * `codex://threads/<id>` link must add a match path, not replace one: a client can
+ * literally send a `codex://threads/…` session id, which is hashed whole for storage,
+ * so the untouched paste stays a candidate too.
+ */
+export function logConversationQueryCandidates(query: string): string[] {
+  const trimmed = query.trim();
+  const unwrapped = unwrapLogConversationQuery(trimmed);
+  return unwrapped === trimmed ? [unwrapped] : [unwrapped, trimmed];
+}
+
 /**
  * Filter match: accept either the persisted digest or the original preimage
  * (so pasting from Logs detail or the client-facing session id both work).
@@ -46,11 +87,13 @@ export function matchesLogConversationId(
   query: string | undefined | null,
 ): boolean {
   if (!stored) return false;
-  const trimmed = typeof query === "string" ? query.trim() : "";
-  if (!trimmed) return false;
-  if (stored === trimmed) return true;
-  const hashed = normalizeLogConversationId(trimmed);
-  return hashed !== undefined && stored === hashed;
+  for (const candidate of logConversationQueryCandidates(typeof query === "string" ? query : "")) {
+    if (!candidate) continue;
+    if (stored === candidate) return true;
+    const hashed = normalizeLogConversationId(candidate);
+    if (hashed !== undefined && stored === hashed) return true;
+  }
+  return false;
 }
 
 /**
@@ -59,6 +102,60 @@ export function matchesLogConversationId(
  */
 export function sessionIdHeaderFromRequest(headers: Headers): string | null {
   return headers.get("session_id") ?? headers.get("session-id");
+}
+
+/**
+ * Fixed-size logical turn lane (#820).
+ *
+ * A lane must be as SPECIFIC as the identity available. `codexPoolAffinityKey` used to be the
+ * opposite: it preferred the parent thread, so a whole subagent fan-out shared one entry, and a
+ * lane keyed that way would have put every parallel subagent of one parent into a single lane
+ * and rejected all but the first with 503 — the fan-out is the normal case, not an abuse.
+ * Since #4546 affinity keys every thread as ITSELF and reads the parent only as a first-placement
+ * hint, so the two now agree on the unit. They still derive it differently: a lane is a digest an
+ * operator can match against what the client sent, while an affinity key is an opaque HMAC
+ * precisely so no caller-supplied identifier ends up in Pool state.
+ *
+ * The parent stays a QUALIFIER here, never the lane on its own when a child thread exists: the
+ * pair separates siblings while still keeping one conversation's overlapping turns together.
+ */
+export function sessionLaneIdFromRequest(headers: Headers): string | undefined {
+  const parent = normalizeLogConversationId(headers.get("x-codex-parent-thread-id"));
+  const thread = normalizeLogConversationId(headers.get("thread-id"));
+  const session = normalizeLogConversationId(sessionIdHeaderFromRequest(headers));
+  const specific = thread ?? session;
+  if (parent && specific) return `${parent}\u0000${specific}`;
+  return specific ?? parent;
+}
+
+function firstSanitizedConversationId(
+  ...values: Array<string | null | undefined>
+): string | undefined {
+  for (const value of values) {
+    const sanitized = sanitizeConversationIdInput(value);
+    if (sanitized) return sanitized;
+  }
+  return undefined;
+}
+
+/**
+ * Conversation namespace for reasoning replay. Unlike the persisted log id, this stays the raw
+ * sanitized identity so mixed headers that carry the same conversation still hit one serving
+ * record. Do not hash, and do not prefer session_id over a true per-conversation thread/Cursor
+ * identity: session_id can be synthesized from a shared prompt_cache_key.
+ */
+export function reasoningReplayConversationIdFromResponsesRequest(input: {
+  clientThreadId?: string;
+  threadIdHeader?: string | null;
+  cursorConversationId?: string;
+  sessionIdHeader?: string | null;
+}): string | undefined {
+  return firstSanitizedConversationId(
+    input.clientThreadId,
+    input.threadIdHeader,
+    input.cursorConversationId,
+    input.sessionIdHeader,
+  );
 }
 
 export function conversationIdFromResponsesRequest(input: {
@@ -165,4 +262,43 @@ export function summarizeConversationLogs(entries: readonly TotalsSource[]): Con
     unpricedRequests,
     unmeteredRequests,
   };
+}
+
+/**
+ * Request-scoped Go affinity for requests that carry no conversation identity.
+ *
+ * A sessionless request must still reach OpenCode Go with `x-opencode-session`, because the upstream
+ * began rejecting requests without it on 2026-09-06. It must not reuse one global value either, which
+ * would smear unrelated probes into a single conversation. So the lane is allocated once per admitted
+ * `Request` object and retained for that object's lifetime.
+ *
+ * The identity has to survive every place the proxy rebuilds a `Request`: translation to the internal
+ * Responses shape, compaction, and — the boundary that matters most — the policy fallback retry, where
+ * a second candidate would otherwise be handed a freshly minted lane after a retryable failure.
+ * `linkRequestSessionLane` carries the allocation across those boundaries.
+ */
+const requestAllocatedSessionLanes = new WeakMap<Request, string>();
+
+/**
+ * Resolve the session lane for a request: real conversation identity when the client supplied it,
+ * otherwise a per-request value allocated once and reused for retries on the same object.
+ */
+export function getOrAllocateRequestSessionLane(req: Request): string {
+  const explicit = sessionLaneIdFromRequest(req.headers)
+    ?? normalizeLogConversationId(req.headers.get("x-opencode-session"));
+  if (explicit) return explicit;
+
+  const existing = requestAllocatedSessionLanes.get(req);
+  if (existing) return existing;
+  const allocated = randomUUID();
+  requestAllocatedSessionLanes.set(req, allocated);
+  return allocated;
+}
+
+/**
+ * Carry a source request's lane onto a request the proxy built from it, so a rebuilt request keeps
+ * the conversation it belongs to instead of looking sessionless again.
+ */
+export function linkRequestSessionLane(sourceReq: Request, targetReq: Request): void {
+  requestAllocatedSessionLanes.set(targetReq, getOrAllocateRequestSessionLane(sourceReq));
 }

@@ -7,9 +7,12 @@
  *
  * Design of record: devlog/_fin/260802_client_toggle_api/021 §5-6.
  */
-import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { lstatSync, mkdirSync, rmSync, statSync } from "node:fs";
 import type { ConfigFormat } from "../clients/config-export";
-import { atomicWriteFile } from "../config";
+import { readBoundedRegularFileSync } from "../lib/bounded-file-read";
+import { canonicalizeJsonc } from "../lib/jsonc";
+import { MAX_JSON_NESTING } from "./serialize";
+import { atomicWriteFileNoFollow, isMissingPathError } from "../config/atomic-write";
 import type { JournalEntry } from "./journal";
 import type { OwnershipRecord } from "./ownership";
 import type { IntegrationClientId } from "./registry";
@@ -22,13 +25,142 @@ import type { IntegrationClientId } from "./registry";
  * then overwritten.
  */
 export const PARSE_FAILED = Symbol("parse-failed");
+const MAX_INTEGRATION_CONFIG_FILE_BYTES = 4 * 1024 * 1024;
+
+/** Raised before any target mutation, including pending-marker creation. */
+export class IntegrationWriteSizeError extends Error {}
+
+/**
+ * What `JSON.parse` has already discarded by the time we hold the parsed value,
+ * and a rewrite would therefore silently change. Both classes are invisible in
+ * the parsed object, which is why this scans the RAW text — same reasoning as
+ * the TOML inf/nan guard below.
+ *
+ * Numbers: `1e999` overflows to Infinity (a rewrite bakes in `null` — the merge
+ * layer's JSON clone does it even before the serializer could refuse), `1e-9999`
+ * underflows to `+0`, an integer literal may have been rounded (a rewrite then
+ * hands consumers that read JSON integers exactly — python, jq, BigInt revivers
+ * — a different value), and `-0` re-serializes as `0`. Only literals whose value
+ * actually changed are refused: `1e21`, `1e-320` or 2^54 round-trip exactly and
+ * stay usable.
+ *
+ * Duplicate members: `{"a":1,"a":2}` parses to a single `a`, so rewriting the
+ * document DELETES the earlier member. That is content loss, not the formatting
+ * normalization we promise, and this classifier is what makes the rewrite of a
+ * user-edited file reachable at all — so it fails closed here.
+ *
+ * Depth: the same pass counts container nesting against MAX_JSON_NESTING
+ * (shared with the serializer, see serialize.ts). JSON.parse handles hundreds
+ * of thousands of levels iteratively, but the downstream merge and
+ * JSON.stringify recurse — a 100KB file nested 50k deep sailed through parse
+ * and guard, then blew up serialization with a raw RangeError after a
+ * multi-GB allocation spike. A hand-written scan rather than a JSON.parse
+ * source-access reviver on purpose: the reviver walk recurses internally, so
+ * its depth limit would be an unpredictable stack size instead of this
+ * deterministic ceiling.
+ */
+function jsonTextSafeToRewrite(text: string): boolean {
+  /**
+   * One frame per open container; a Set of member names for objects, null for
+   * arrays. Its length is the current nesting depth.
+   */
+  const containers: Array<Set<string> | null> = [];
+  /** The most recent string literal — the member name if a `:` follows. */
+  let lastString: string | null = null;
+  let inString = false;
+  let escaped = false;
+  let stringStart = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") {
+        inString = false;
+        lastString = text.slice(stringStart, i + 1);
+      }
+      continue;
+    }
+    if (ch === "\"") { inString = true; stringStart = i; continue; }
+    if (ch === "{" || ch === "[") {
+      containers.push(ch === "{" ? new Set<string>() : null);
+      if (containers.length > MAX_JSON_NESTING) return false;
+      lastString = null;
+      continue;
+    }
+    if (ch === "}" || ch === "]") { containers.pop(); lastString = null; continue; }
+    if (ch === ":") {
+      const members = containers[containers.length - 1];
+      if (members && lastString !== null) {
+        /*
+         * Decoded, not raw: `"a"` and `"a"` are spellings of ONE member,
+         * and JSON.parse keeps only the last of them.
+         */
+        let name: string;
+        try { name = JSON.parse(lastString) as string; } catch { return false; }
+        if (members.has(name)) return false;
+        members.add(name);
+      }
+      lastString = null;
+      continue;
+    }
+    if (ch !== "-" && (ch < "0" || ch > "9")) continue;
+    let end = i + 1;
+    while (end < text.length && /[0-9+\-.eE]/.test(text[end]!)) end += 1;
+    const literal = text.slice(i, end);
+    i = end - 1;
+    const value = Number(literal);
+    if (!Number.isFinite(value)) return false;
+    if (value === 0) {
+      /*
+       * `-0` (re-serializes as `0`) and underflow: `1e-9999` is a nonzero
+       * value the parse already flattened to `+0`. The significand alone
+       * decides, so genuine zero spellings (`0`, `0.0`, `0e10`) stay usable.
+       */
+      if (literal.startsWith("-") || /[1-9]/.test(literal.split(/[eE]/)[0]!)) return false;
+    }
+    /*
+     * Deliberately plain digit runs only. They are the one spelling real
+     * consumers read with exact integer semantics (python's json yields an
+     * arbitrary-precision int, jq preserves big integer literals), so baking
+     * in the rounded double changes what those consumers extract. Decimal or
+     * exponent spellings of the same value (`9007199254740993e0`, `…3.0`) are
+     * float semantics for every consumer — they round identically before and
+     * after a rewrite, and shortest-round-trip stringify preserves what any
+     * reader can observe, so refusing them would only manufacture dead ends
+     * (`1e308` is not exactly representable either, yet rewrites losslessly
+     * for every possible reader).
+     */
+    const digits = literal[0] === "-" ? literal.slice(1) : literal;
+    if (/^[0-9]{16,}$/.test(digits) && BigInt(literal) !== BigInt(value)) return false;
+  }
+  return true;
+}
 
 /** Parse a client config, tolerating absence. PARSE_FAILED on garbage. */
-export function parseConfig(text: string | null, format: ConfigFormat): unknown | typeof PARSE_FAILED {
+export function parseConfig(
+  text: string | null,
+  format: ConfigFormat,
+  options?: { jsonc?: boolean },
+): unknown | typeof PARSE_FAILED {
   if (text === null || text.trim().length === 0) return {};
   try {
     switch (format) {
-      case "json": return JSON.parse(text);
+      case "json": {
+        /*
+         * Scanned BEFORE parsing: the guard is text-only, and refusing first
+         * means a hostile document is never materialized — the depth ceiling
+         * would otherwise cap the rewrite only after JSON.parse had already
+         * built the 50k-deep object graph. The outcome is unchanged: invalid
+         * JSON still returns PARSE_FAILED, from the catch below.
+         *
+         * Kilo's global file is JSONC. Comments and trailing commas are
+         * stripped first so the rewrite-safety scan sees JSON, not comment text.
+         */
+        const source = options?.jsonc ? canonicalizeJsonc(text) : text;
+        if (!jsonTextSafeToRewrite(source)) return PARSE_FAILED;
+        return JSON.parse(source);
+      }
       case "json5": return Bun.JSON5.parse(text);
       case "yaml": return Bun.YAML.parse(text);
       case "toml": {
@@ -44,7 +176,22 @@ export function parseConfig(text: string | null, format: ConfigFormat): unknown 
          * evidence is gone.
          */
         if (/(^|[\s,[=])[-+]?(?:inf|nan)(?=[\s,\]]|$)/mi.test(text)) return PARSE_FAILED;
-        return Bun.TOML.parse(text);
+        const document = Bun.TOML.parse(text);
+        // TOML date/time scalars are Temporal objects with toJSON methods.
+        // The merge layer JSON-clones documents, which silently turns these
+        // into strings. Refuse before either status or a writer can admit a
+        // lossy rewrite, including dates nested in arrays and inline tables.
+        const pending: unknown[] = [document];
+        while (pending.length > 0) {
+          const value = pending.pop();
+          if (value === null || typeof value !== "object") continue;
+          if (!Array.isArray(value)) {
+            const prototype = Object.getPrototypeOf(value);
+            if (prototype !== Object.prototype && prototype !== null) return PARSE_FAILED;
+          }
+          for (const child of Object.values(value)) pending.push(child);
+        }
+        return document;
       }
     }
   } catch {
@@ -59,6 +206,15 @@ export type ReadResult =
 
 export type StatKind = "file" | "dir" | "other" | "missing" | "failed";
 
+function lstatKind(path: string): StatKind {
+  try {
+    const stats = lstatSync(path);
+    return stats.isFile() ? "file" : stats.isDirectory() ? "dir" : "other";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "failed";
+  }
+}
+
 export interface IntegrationIO {
   /**
    * ONLY a missing file yields `missing`. Every other failure (EACCES, EPERM,
@@ -67,6 +223,8 @@ export interface IntegrationIO {
   readText: (path: string) => ReadResult;
   /** `failed` is distinct from `missing` for the same reason. */
   statKind: (path: string) => StatKind;
+  /** Optional no-follow probe for paired-file clients. */
+  lstatKind?: (path: string) => StatKind;
   writeText: (path: string, text: string) => void;
   removeFile: (path: string) => void;
   mkdirp: (path: string) => void;
@@ -75,6 +233,16 @@ export interface IntegrationIO {
   appendJournal: (entry: JournalEntry) => void;
   putRecord: (record: OwnershipRecord) => void;
   dropRecord: (clientId: IntegrationClientId) => void;
+  beginTransaction?: (transaction: IntegrationTransaction) => void;
+  finishTransaction?: () => void;
+}
+
+export interface IntegrationTransaction {
+  entry: JournalEntry;
+  before: string | null;
+  nextText: string | null;
+  record: OwnershipRecord | null;
+  priorRecord: OwnershipRecord | null;
 }
 
 export type TargetState =
@@ -89,6 +257,18 @@ export type TargetState =
  * an unreadable config gets clobbered.
  */
 export function loadTarget(io: IntegrationIO, configPath: string): TargetState {
+  // Managed client paths are a lower-trust boundary. Never inspect through a
+  // final symlink that can be retargeted between this read and the eventual
+  // write: when a no-follow probe exists, the named directory entry itself must
+  // be a regular file or absent. `missing` stays legal so a virtual pair probe
+  // (such as Cline's pair-aware statKind) can still report one absent member.
+  const named = io.lstatKind?.(configPath);
+  // A failed probe is uncertainty, not evidence about the entry's shape: it
+  // keeps the read-failed classification the follow-probe would have produced.
+  if (named === "failed") return { ok: false, why: "read-failed" };
+  if (named !== undefined && named !== "file" && named !== "missing") {
+    return { ok: false, why: "not-regular-file" };
+  }
   const kind = io.statKind(configPath);
   if (kind === "missing") return { ok: true, before: null };
   if (kind === "failed") return { ok: false, why: "read-failed" };
@@ -107,9 +287,10 @@ export function loadTarget(io: IntegrationIO, configPath: string): TargetState {
  */
 export function fileIO(): Omit<IntegrationIO, "appendJournal" | "putRecord" | "dropRecord"> {
   return {
+    lstatKind,
     readText: path => {
       try {
-        return { kind: "text", text: readFileSync(path, "utf8") };
+        return { kind: "text", text: readBoundedRegularFileSync(path, MAX_INTEGRATION_CONFIG_FILE_BYTES).toString("utf8") };
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code;
         return code === "ENOENT" ? { kind: "missing" } : { kind: "failed", ...(code ? { code } : {}) };
@@ -123,7 +304,43 @@ export function fileIO(): Omit<IntegrationIO, "appendJournal" | "putRecord" | "d
         return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "failed";
       }
     },
-    writeText: (path, text) => atomicWriteFile(path, text),
+    writeText: (path, text) => {
+      /*
+       * One bound on both halves of the seam: a file past this size is one
+       * readText refuses, so writing it would strand the integration against
+       * its own configuration — or, for Cline's pending marker, leave a
+       * transaction recovery could never read back.
+       */
+      const bytes = Buffer.byteLength(text, "utf8");
+      if (bytes > MAX_INTEGRATION_CONFIG_FILE_BYTES) {
+        throw new IntegrationWriteSizeError(
+          `refusing oversized integration write to ${path}: `
+          + `${bytes} bytes is past the ${MAX_INTEGRATION_CONFIG_FILE_BYTES}-byte read bound`,
+        );
+      }
+      const kind = lstatKind(path);
+      if (kind !== "file" && kind !== "missing") {
+        throw new Error(`refusing unsafe integration write target: ${path}`);
+      }
+      assertIntegrationWriteOwnership(path);
+      atomicWriteFileNoFollow(path, text, undefined, {
+        // The pre-check above rejects a symlink already in place; this one runs
+        // inside the atomic write immediately before the rename, so a link
+        // exchanged after validation is refused rather than followed. Even a
+        // swap past this point can only replace the named entry, never redirect
+        // the write through it.
+        validateBeforeRename: target => {
+          try {
+            if (lstatSync(target).isSymbolicLink()) {
+              throw new Error(`refusing to replace symbolic-link integration target: ${target}`);
+            }
+          } catch (error) {
+            if (isMissingPathError(error)) return;
+            throw error;
+          }
+        },
+      });
+    },
     removeFile: path => rmSync(path, { force: true }),
     mkdirp: path => mkdirSync(path, { recursive: true, mode: 0o700 }),
     now: () => Date.now(),
@@ -148,4 +365,53 @@ export function defaultIntegrationIO(store: {
     putRecord: record => store.putRecord(record),
     dropRecord: clientId => store.dropRecord(clientId),
   };
+}
+
+/**
+ * Refuse to replace an integration file this process does not own.
+ *
+ * `atomicWriteFile` writes a private temp file and renames it over the target. That is the right
+ * shape for a secret — the replacement is atomic and the result is owner-only `0600` — but it also
+ * means the surviving inode belongs to whoever runs opencodex. When the target is another product's
+ * configuration on a shared mount, the replace quietly takes the file away from its owner. #4197 is
+ * that case: opencodex at uid 1000 replaces a DSH `settings.yaml` owned by uid 987, and DSH dies with
+ * `EACCES` on its next read while the restore call reports success.
+ *
+ * Preserving the previous uid would need a `chown` capability we usually do not have, and relaxing
+ * `0600` would weaken every integration to fix one. So refuse before writing, and say what is wrong,
+ * rather than succeeding into a broken state.
+ *
+ * Windows has no uid model here; `hardenSecretPath` owns that platform, so the check is skipped when
+ * the runtime exposes no effective uid.
+ */
+export function assertIntegrationWriteOwnership(
+  path: string,
+  deps: {
+    effectiveUid?: () => number | undefined;
+    ownerUid?: (target: string) => number | undefined;
+  } = {},
+): void {
+  const effectiveUid = deps.effectiveUid ?? (() =>
+    typeof process.geteuid === "function" ? process.geteuid() : undefined);
+  const euid = effectiveUid();
+  if (euid === undefined) return;
+
+  const ownerUid = deps.ownerUid ?? ((target: string) => {
+    try {
+      return statSync(target).uid;
+    } catch {
+      // An absent or unreadable target has no owner to dispossess; the write itself will report
+      // any real failure.
+      return undefined;
+    }
+  });
+  const owner = ownerUid(path);
+  if (owner === undefined || owner === euid) return;
+
+  throw new Error(
+    `refusing to replace ${path}: it belongs to uid ${owner} while opencodex runs as uid ${euid}. `
+    + "An atomic replace would transfer ownership of that file and leave its owner unable to read "
+    + "its own configuration. Run both under the same user, or give each one its own copy instead "
+    + "of sharing the mount.",
+  );
 }

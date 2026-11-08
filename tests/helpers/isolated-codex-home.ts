@@ -5,6 +5,10 @@ import { removeTreeWithRetry } from "./remove-tree";
 
 export interface IsolatedCodexHome {
   path: string;
+  /** Restore CODEX_HOME without deleting an undrained tree. */
+  restoreEnvironment(): void;
+  /** Remove only after producers have drained; failures propagate. */
+  removeAfterDrain(): void;
   restore(): void;
 }
 
@@ -14,12 +18,32 @@ export function installIsolatedCodexHome(prefix = "ocx-codex-home-"): IsolatedCo
   writeFileSync(join(path, "config.toml"), 'model_catalog_json = "opencodex-catalog.json"\n', "utf8");
   process.env.CODEX_HOME = path;
 
+  let restored = false;
+  const restoreEnvironment = () => {
+    if (restored) return;
+    restored = true;
+    if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previousCodexHome;
+  };
   return {
     path,
+    restoreEnvironment,
+    removeAfterDrain() { removeTreeWithRetry(path); },
     restore() {
-      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
-      else process.env.CODEX_HOME = previousCodexHome;
-      removeTreeWithRetry(path);
+      restoreEnvironment();
+      // The env restore above is the part other tests depend on; the directory is
+      // disposable. On Windows a proxy or child that is still shutting down can hold
+      // a file in this tree open past the retry budget, and rethrowing there failed a
+      // test that had already finished asserting -- it read as a defect in whatever
+      // ran here rather than as an OS release race. The owning test root now contains
+      // and removes this path, so a swallowed failure here no longer strands a directory
+      // directly under the user's TEMP -- it strands one inside a tree that goes away with
+      // the run, or with a later run that can prove it owned that tree.
+      try {
+        removeTreeWithRetry(path);
+      } catch {
+        // Deliberately swallowed: see above.
+      }
     },
   };
 }

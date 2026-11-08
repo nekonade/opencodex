@@ -12,6 +12,7 @@ on:
       - ".github/scripts/pr-quality-messages.cjs"
       - ".github/scripts/pr-quality-messages.test.cjs"
       - ".github/scripts/pr-quality-state.cjs"
+      - ".github/scripts/pr-readiness-reattest.cjs"
       - ".github/scripts/pr-quality-state.test.cjs"
       - ".github/scripts/pr-labeler.cjs"
       - ".github/scripts/pr-labeler.test.cjs"
@@ -22,9 +23,10 @@ on:
       - ".github/scripts/pr-sponsored-surface.test.cjs"
       - ".github/scripts/issue-translation.cjs"
       - ".github/scripts/issue-translation.test.cjs"
-      - ".github/scripts/issue-triage.cjs"
-      - ".github/scripts/issue-triage.test.cjs"
+      - ".github/scripts/issue-triage*.cjs"
       - ".github/scripts/copilot-workflows.test.cjs"
+      - ".github/scripts/install-copilot-cli.sh"
+      - ".github/scripts/run-copilot-inference*.cjs"
       - ".github/scripts/parse-issue-translation-response.cjs"
       - ".github/scripts/parse-issue-translation-response.test.cjs"
       - ".github/workflows/enforce-issue-quality.yml"
@@ -34,6 +36,8 @@ on:
       - ".github/workflows/issue-quality-tests.yml"
       - ".github/workflows/pr-hygiene.yml"
   push:
+    # Release lines only; review is covered by the pull_request trigger above.
+    branches: [main, preview]
     paths:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/scripts/issue-quality.cjs"
@@ -44,6 +48,7 @@ on:
       - ".github/scripts/pr-quality-messages.cjs"
       - ".github/scripts/pr-quality-messages.test.cjs"
       - ".github/scripts/pr-quality-state.cjs"
+      - ".github/scripts/pr-readiness-reattest.cjs"
       - ".github/scripts/pr-quality-state.test.cjs"
       - ".github/scripts/pr-labeler.cjs"
       - ".github/scripts/pr-labeler.test.cjs"
@@ -54,9 +59,10 @@ on:
       - ".github/scripts/pr-sponsored-surface.test.cjs"
       - ".github/scripts/issue-translation.cjs"
       - ".github/scripts/issue-translation.test.cjs"
-      - ".github/scripts/issue-triage.cjs"
-      - ".github/scripts/issue-triage.test.cjs"
+      - ".github/scripts/issue-triage*.cjs"
       - ".github/scripts/copilot-workflows.test.cjs"
+      - ".github/scripts/install-copilot-cli.sh"
+      - ".github/scripts/run-copilot-inference*.cjs"
       - ".github/scripts/parse-issue-translation-response.cjs"
       - ".github/scripts/parse-issue-translation-response.test.cjs"
       - ".github/workflows/enforce-issue-quality.yml"
@@ -90,8 +96,9 @@ jobs:
           node --test .github/scripts/pr-hygiene.test.cjs
           node --test .github/scripts/pr-sponsored-surface.test.cjs
           node --test .github/scripts/issue-translation.test.cjs
-          node --test .github/scripts/issue-triage.test.cjs
+          node --test .github/scripts/issue-triage*.test.cjs
           node --test .github/scripts/copilot-workflows.test.cjs
+          node --test .github/scripts/run-copilot-inference.test.cjs
           node --test .github/scripts/parse-issue-translation-response.test.cjs
 
       - name: Validate issue-form YAML

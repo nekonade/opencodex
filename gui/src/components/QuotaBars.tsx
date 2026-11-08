@@ -1,4 +1,4 @@
-import type { CSSProperties } from "react";
+import { Fragment, type CSSProperties, type ReactNode } from "react";
 import type { Locale, TFn } from "../i18n/shared";
 import { useI18n } from "../i18n/shared";
 import { IconAlert } from "../icons";
@@ -9,6 +9,7 @@ import { type AccountQuota, normalizeQuotaForPlan } from "../codex-quota-utils";
 
 export type QuotaWindowKey = "fiveHour" | "weekly" | "monthly";
 export type QuotaBarRow = {
+  id: string;
   windowKey?: QuotaWindowKey;
   customLabel?: string;
   label: string;
@@ -20,13 +21,36 @@ export type QuotaBarRow = {
 /**
  * Window ordering is computed from RAW wire identities BEFORE localization
  * (ranking on translated labels breaks the moment a locale changes copy):
- * shorter windows first — 5h, weekly, cursor first-party, cursor API, monthly.
+ * shorter windows first — 5h, weekly, cursor first-party, cursor API, monthly,
+ * then subscription credits before other custom windows.
  */
 function rawCustomWindowRank(rawLabel: string): number {
   if (rawLabel === "5h") return 0;
   if (rawLabel === "First-party models") return 2;
   if (rawLabel === "API usage") return 3;
+  if (rawLabel === "Total subscription credits") return 4.5;
   return 5;
+}
+
+const SUBSCRIPTION_CREDITS_LABEL = "Total subscription credits";
+
+function canonicalCustomWindowLabel(rawLabel: string): string {
+  return rawLabel.trim().toLowerCase() === SUBSCRIPTION_CREDITS_LABEL.toLowerCase()
+    ? SUBSCRIPTION_CREDITS_LABEL
+    : rawLabel;
+}
+
+/** Coverage metadata carries raw labels, while subscription rows use a canonical identity. */
+export function isCustomQuotaWindowIncomplete(
+  customLabel: string | undefined,
+  incompleteLabels?: ReadonlySet<string>,
+): boolean {
+  if (customLabel === undefined || !incompleteLabels) return false;
+  const canonical = canonicalCustomWindowLabel(customLabel);
+  for (const label of incompleteLabels) {
+    if (canonicalCustomWindowLabel(label) === canonical) return true;
+  }
+  return false;
 }
 
 function localizeCustomQuotaLabel(rawLabel: string, t: TFn): string {
@@ -46,7 +70,7 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
   const displayQuota = normalizeQuotaForPlan(quota, plan);
   if (!displayQuota) return [];
   // Intrinsic ranks for the standard slots; custom windows rank on their RAW labels.
-  const ranked: Array<{ rank: number; row: QuotaBarRow }> = [];
+  const ranked: Array<{ rank: number; row: Omit<QuotaBarRow, "id"> & { id?: string } }> = [];
   if (typeof displayQuota.fiveHourPercent === "number") {
     ranked.push({
       rank: 0,
@@ -84,11 +108,13 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
     });
   }
   for (const w of displayQuota.customWindows ?? []) {
-    const localized = localizeCustomQuotaLabel(w.label, t);
+    const customLabel = canonicalCustomWindowLabel(w.label);
+    const localized = localizeCustomQuotaLabel(customLabel, t);
     ranked.push({
-      rank: rawCustomWindowRank(w.label),
+      rank: rawCustomWindowRank(customLabel),
       row: {
-        customLabel: w.label,
+        id: JSON.stringify([w.modelId ?? null, w.label, w.resetAt ?? null]),
+        customLabel,
         label: localized,
         limitLabel: localized,
         percent: w.percent,
@@ -96,7 +122,31 @@ export function buildQuotaRows(quota: AccountQuota | null, plan: string | null |
       },
     });
   }
-  return ranked.sort((a, b) => a.rank - b.rank).map(entry => entry.row);
+  if (displayQuota.creditsUsd && typeof displayQuota.creditsUsd.percent === "number") {
+    const hasSubscriptionCreditsCustom = displayQuota.customWindows?.some(
+      w => w.modelId === undefined && canonicalCustomWindowLabel(w.label) === SUBSCRIPTION_CREDITS_LABEL,
+    );
+    if (!hasSubscriptionCreditsCustom) {
+      const localized = localizeCustomQuotaLabel(SUBSCRIPTION_CREDITS_LABEL, t);
+      ranked.push({
+        rank: rawCustomWindowRank(SUBSCRIPTION_CREDITS_LABEL),
+        row: {
+          customLabel: SUBSCRIPTION_CREDITS_LABEL,
+          label: localized,
+          limitLabel: localized,
+          percent: displayQuota.creditsUsd.percent,
+          resetAt: displayQuota.creditsUsd.expiresAt,
+        },
+      });
+    }
+  }
+  const identities = new Map<string, number>();
+  return ranked.sort((a, b) => a.rank - b.rank).map(({ row }) => {
+    const identity = row.id ?? row.windowKey ?? row.customLabel!;
+    const ordinal = identities.get(identity) ?? 0;
+    identities.set(identity, ordinal + 1);
+    return { ...row, id: JSON.stringify([identity, ordinal]) };
+  });
 }
 
 /** Max utilisation across known windows (for sorting providers by urgency). */
@@ -105,7 +155,14 @@ export function maxQuotaUtilisation(quota: AccountQuota | null): number {
   const vals = [quota.fiveHourPercent, quota.weeklyPercent, quota.monthlyPercent]
     .filter((n): n is number => typeof n === "number");
   for (const w of quota.customWindows ?? []) {
+    if (w.modelId !== undefined) continue;
     if (typeof w.percent === "number") vals.push(w.percent);
+  }
+  const hasSubscriptionCreditsCustom = quota.customWindows?.some(
+    w => w.modelId === undefined && canonicalCustomWindowLabel(w.label) === SUBSCRIPTION_CREDITS_LABEL,
+  );
+  if (!hasSubscriptionCreditsCustom && typeof quota.creditsUsd?.percent === "number") {
+    vals.push(quota.creditsUsd.percent);
   }
   return vals.length ? Math.max(...vals) : -1;
 }
@@ -116,6 +173,8 @@ function bcp47(locale: Locale): string {
       return "en-GB";
     case "de":
       return "de-DE";
+    case "fr":
+      return "fr-FR";
     case "ko":
       return "ko-KR";
     case "zh":
@@ -128,6 +187,10 @@ function bcp47(locale: Locale): string {
       return "ja-JP";
     case "tr":
       return "tr-TR";
+    case "vi":
+      return "vi-VN";
+    case "pt":
+      return "pt-BR";
     default: {
       const _exhaustive: never = locale;
       return _exhaustive;
@@ -159,6 +222,23 @@ function barFillStyle(percent: number): CSSProperties {
   return { ["--bar-scale" as string]: String(barWidth(percent) / 100) };
 }
 
+/**
+ * How long ago an observation was taken, bucketed.
+ *
+ * Coarse on purpose: a passively observed quota is only as precise as the moment it was
+ * seen, and a to-the-second age would imply a freshness the number does not have.
+ * Negative elapsed (clock skew between the proxy that wrote it and this browser) reads as
+ * just-now rather than as a negative age.
+ */
+export function formatObservedAge(observedAt: number, t: TFn, now = Date.now()): string | null {
+  const elapsed = now - observedAt;
+  if (!Number.isFinite(elapsed) || elapsed < 60_000) return null;
+  // Units go through t(): the suffix is copy, and "m"/"h"/"d" do not survive translation.
+  if (elapsed < 60 * 60_000) return t("quota.ageMinutes").replace("{n}", String(Math.floor(elapsed / 60_000)));
+  if (elapsed < 24 * 60 * 60_000) return t("quota.ageHours").replace("{n}", String(Math.floor(elapsed / (60 * 60_000))));
+  return t("quota.ageDays").replace("{n}", String(Math.floor(elapsed / (24 * 60 * 60_000))));
+}
+
 export default function QuotaBars({
   quota,
   plan,
@@ -169,6 +249,8 @@ export default function QuotaBars({
   pending = false,
   incompleteWindowKeys,
   incompleteCustomWindowLabels,
+  observedAt,
+  afterWeekly,
 }: {
   quota: AccountQuota | null;
   plan?: string | null;
@@ -185,11 +267,32 @@ export default function QuotaBars({
   /** Optional overview-only coverage status. Other quota surfaces remain unchanged when omitted. */
   incompleteWindowKeys?: ReadonlySet<QuotaWindowKey>;
   incompleteCustomWindowLabels?: ReadonlySet<string>;
+  /**
+   * When set, state how old these numbers are.
+   *
+   * Set ONLY for a passively observed quota, where the value arrives as a side effect of
+   * a real request and nothing refreshes it. A probed provider re-reads on its own TTL,
+   * so an age line there would be noise; here its absence would let a days-old reading
+   * look live.
+   */
+  observedAt?: number;
+  /** Compact-only slot after Week, or after the last row when Week is absent. */
+  afterWeekly?: ReactNode;
 }) {
   const { locale } = useI18n();
   const rows = buildQuotaRows(quota, plan, t);
+  // Rendered above the bars in both layouts. Null age (under a minute, or no observation)
+  // renders nothing rather than "just now", which would be one more thing to read.
+  const observedAge = observedAt === undefined ? null : formatObservedAge(observedAt, t);
+  const observedLine = observedAge === null ? null : (
+    <p className="quota-observed muted" title={t("quota.observedHint")}>
+      {t("quota.observedAgo").replace("{age}", observedAge)}
+    </p>
+  );
   if (rows.length === 0) {
-    if (!pending) return null;
+    if (!pending) return layout === "compact" && afterWeekly ? (
+      <div className={`codex-account-quota-slot quota-compact${className ? ` ${className}` : ""}`}>{afterWeekly}</div>
+    ) : null;
     if (layout === "stacked") {
       return (
         <div className={`quota-stacked quota-stacked--pending${className ? ` ${className}` : ""}`} aria-busy="true" role="status">
@@ -219,6 +322,9 @@ export default function QuotaBars({
       >
         <div className="quota-row quota-row--skeleton" aria-hidden="true">
           <span className="quota-skel quota-skel--label" />
+          <span className="quota-skel quota-skel--reset" />
+          <span className="quota-skel quota-skel--day" />
+          <span className="quota-skel quota-skel--time" />
           <span className="quota-skel quota-skel--bar" />
           <span className="quota-skel quota-skel--val" />
         </div>
@@ -229,16 +335,17 @@ export default function QuotaBars({
   if (layout === "stacked") {
     return (
       <div className={`quota-stacked${className ? ` ${className}` : ""}`}>
+        {observedLine}
         {rows.map(row => (
           <StackedQuotaRow
-            key={row.limitLabel}
+            key={row.id}
             row={row}
             threshold={threshold}
             t={t}
             locale={locale}
             incomplete={row.windowKey
               ? incompleteWindowKeys?.has(row.windowKey) === true
-              : row.customLabel !== undefined && incompleteCustomWindowLabels?.has(row.customLabel) === true}
+              : isCustomQuotaWindowIncomplete(row.customLabel, incompleteCustomWindowLabels)}
           />
         ))}
       </div>
@@ -246,22 +353,28 @@ export default function QuotaBars({
   }
   return (
     <div className={`codex-account-quota-slot quota-compact${className ? ` ${className}` : ""}`}>
+      {observedLine}
       {rows.map(row => (
-        <QuotaRow
-          key={row.label}
-          label={row.label}
-          percent={row.percent}
-          resetAt={row.resetAt}
-          threshold={threshold}
-          t={t}
-          locale={locale}
-        />
+        <Fragment key={row.id}>
+          <QuotaRow
+            credits={row.customLabel === SUBSCRIPTION_CREDITS_LABEL}
+            label={row.label}
+            percent={row.percent}
+            resetAt={row.resetAt}
+            threshold={threshold}
+            t={t}
+            locale={locale}
+          />
+          {row.windowKey === "weekly" && afterWeekly}
+        </Fragment>
       ))}
+      {!rows.some(row => row.windowKey === "weekly") && afterWeekly}
     </div>
   );
 }
 
-function QuotaRow({ label, percent, resetAt, threshold, t, locale }: {
+function QuotaRow({ credits, label, percent, resetAt, threshold, t, locale }: {
+  credits?: boolean;
   label: string;
   percent: number;
   resetAt?: number;
@@ -276,9 +389,13 @@ function QuotaRow({ label, percent, resetAt, threshold, t, locale }: {
   const resetTitle = reset.day || reset.time
     ? `${t("codexAuth.resets")} ${reset.day} ${reset.time}`.replace(/\s+/g, " ").trim()
     : undefined;
+  const hasReset = reset.day !== "" || reset.time !== "";
   return (
-    <div className={`quota-row${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
+    <div className={`quota-row${credits ? " quota-row--credits" : ""}${warn ? " quota-row--warn" : ""}${exhausted ? " quota-row--exhausted" : ""}`}>
       <span className="quota-label" title={resetTitle}>{label}</span>
+      <span className="quota-reset-label">{hasReset ? t("codexAuth.resets") : ""}</span>
+      <span className="quota-reset-day">{reset.day}</span>
+      <span className="quota-reset-time">{reset.time}</span>
       <div className="bar" title={resetTitle}><div className={`bar-fill ${color}`} style={barFillStyle(percent)} /></div>
       <span
         className={`quota-val${warn ? " quota-val--warn" : ""}`}
@@ -340,10 +457,19 @@ function StackedQuotaRow({ row, threshold, t, locale, incomplete }: {
   );
 }
 
-function formatResetAt(resetAt: number | undefined, t: TFn, locale: Locale): { day: string; time: string } {
-  if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return { day: "", time: "" };
+/** Normalize seconds-or-milliseconds epochs and reject values outside JavaScript Date's range. */
+function resetDate(resetAt: number | undefined): { date: Date; ms: number } | null {
+  if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return null;
   const ms = resetAt < 10_000_000_000 ? resetAt * 1000 : resetAt;
   const date = new Date(ms);
+  if (!Number.isFinite(date.getTime())) return null;
+  return { date, ms };
+}
+
+function formatResetAt(resetAt: number | undefined, t: TFn, locale: Locale): { day: string; time: string } {
+  const normalized = resetDate(resetAt);
+  if (!normalized) return { day: "", time: "" };
+  const { date } = normalized;
   const now = new Date();
   const tag = bcp47(locale);
   const time = new Intl.DateTimeFormat(tag, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
@@ -362,9 +488,9 @@ export function formatResetFuture(
   locale: Locale = "en",
   now = Date.now(),
 ): string {
-  if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return "";
-  const ms = resetAt < 10_000_000_000 ? resetAt * 1000 : resetAt;
-  const date = new Date(ms);
+  const normalized = resetDate(resetAt);
+  if (!normalized) return "";
+  const { date, ms } = normalized;
   const tag = bcp47(locale);
   const time = new Intl.DateTimeFormat(tag, { hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
   const nowDate = new Date(now);

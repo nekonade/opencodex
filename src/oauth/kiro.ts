@@ -27,7 +27,9 @@ import {
   type KiroImportDiagnostic,
 } from "./kiro-credentials";
 import { homedir } from "node:os";
-import { getAccountSet, saveAccountCredential } from "./store";
+import { bindKiroAccountUserEmail, getAccountSet, saveAccountCredential } from "./store";
+import { KIRO_BUILDER_ID_SERVICE_PROFILE_ARN } from "../adapters/kiro-constants";
+import { kiroUserEmail } from "./kiro-account-identity";
 
 const DEFAULT_REGION = "us-east-1";
 const REFRESH_URL = "https://prod.{region}.auth.desktop.kiro.dev/refreshToken";
@@ -43,6 +45,10 @@ const KIRO_TERMINAL_REFRESH_ERRORS = new Set([
   "access_denied",
   "expired_token",
 ]);
+// The desktop refresh endpoint rejects a dead refresh token with HTTP 401 and a bare
+// `{"message":"Bad credentials"}` body, without an OAuth `error` code. Only that exact
+// pair is a terminal verdict; it is surfaced under this fixed code, never the raw text.
+const KIRO_DESKTOP_BAD_CREDENTIALS = "bad_credentials";
 
 interface ImportedKiroToken {
   access: string;
@@ -59,6 +65,7 @@ export class KiroTokenRefreshError extends Error {
   constructor(
     readonly httpStatus: number,
     readonly oauthError?: string,
+    readonly refreshAttention = false,
   ) {
     super(`Kiro token refresh failed: ${httpStatus}${oauthError ? ` (${oauthError})` : ""}`);
     this.name = "KiroTokenRefreshError";
@@ -183,6 +190,12 @@ function parseKiroProfileArn(value: unknown): string | undefined {
   return KIRO_PROFILE_ARN_PATTERN.test(trimmed) ? trimmed : undefined;
 }
 
+/** Account identity must never use the request-scoped Builder ID service profile. */
+function accountScopedProfileArn(value: unknown): string | undefined {
+  const parsed = parseKiroProfileArn(value);
+  return parsed && parsed !== KIRO_BUILDER_ID_SERVICE_PROFILE_ARN ? parsed : undefined;
+}
+
 function profileArnFromWhoami(parsed: Record<string, unknown>): string | undefined {
   // Only narrowly-named documented-ish shapes; never invent an ARN (#993).
   return parseKiroProfileArn(parsed.profileArn)
@@ -209,8 +222,9 @@ async function readKiroCliIdentity(runner: KiroCliRunner, signal?: AbortSignal):
 }
 
 function metadataFromImported(imported: ImportedKiroCredential): KiroOAuthMetadata | undefined {
+  const profileArn = accountScopedProfileArn(imported.profileArn);
   const metadata: KiroOAuthMetadata = {
-    ...(imported.profileArn ? { profileArn: imported.profileArn } : {}),
+    ...(profileArn ? { profileArn } : {}),
     ...(imported.ssoRegion ? { ssoRegion: imported.ssoRegion } : {}),
     ...(imported.apiRegion ? { apiRegion: imported.apiRegion } : {}),
     ...(imported.clientId ? { clientId: imported.clientId } : {}),
@@ -237,8 +251,10 @@ export function environmentKiroRoutingMetadata(): Pick<KiroOAuthMetadata, "profi
 }
 
 /**
- * Before Add-account switches the external CLI identity, bind any matching legacy identity-less
- * OCX row to the current CLI session. Unmatched identity-less rows are left alone here so a
+ * Before Add-account switches the external CLI identity, bind any matching legacy OCX row to the
+ * current CLI session: identity-less rows gain their identity, and rows keyed only by a profile
+ * ARN gain the same-session whoami user, so the user being added next is told apart from them
+ * when both share an organization profile (#6641). Unmatched rows are left alone here so a
  * cancelled browser login cannot destroy the only stored credential; after a successful add they
  * remain selectable but cannot borrow the new CLI identity (and reauth refuses identity-less slots).
  */
@@ -249,7 +265,7 @@ async function bindMatchingLegacyIdentitylessKiroAccounts(
   const set = getAccountSet("kiro");
   if (!set) return;
   const legacyAccounts = set.accounts.filter(
-    account => account.credential.accountId === undefined && account.credential.email === undefined,
+    account => account.credential.email === undefined,
   );
   if (legacyAccounts.length === 0) return;
 
@@ -266,7 +282,14 @@ async function bindMatchingLegacyIdentitylessKiroAccounts(
     if (!refresh || imported.refresh !== refresh) continue;
     const bound = await oauthCredentialFromImported(imported, runner, signal);
     if (!bound.accountId && !bound.email) continue;
-    await saveAccountCredential("kiro", account.id, bound);
+    const storedArn = account.credential.accountId;
+    if (storedArn === undefined) {
+      await saveAccountCredential("kiro", account.id, bound);
+      continue;
+    }
+    // An ARN-keyed row only gains its user; tokens, routing, plan and health stay as stored.
+    if (bound.accountId !== storedArn || !bound.email) continue;
+    await bindKiroAccountUserEmail(account.id, { profileArn: storedArn, refresh, email: bound.email });
   }
 }
 
@@ -282,19 +305,24 @@ async function oauthCredentialFromImported(
     // active Kiro CLI session between the SQLite read and whoami. Accept
     // whoami's identity only when the session token STILL matches the import —
     // refresh token, or access token when refresh is absent.
-    if (identity.profileArn !== undefined) {
+    if (identity.profileArn !== undefined || identity.email !== undefined) {
       const current = readKiroCliSqliteCredential();
       const importedKey = imported.refresh || imported.access;
       const currentKey = current ? current.refresh || current.access : "";
       if (!current || currentKey !== importedKey) identity = {};
     }
   }
-  // Builder ID imports often lack a profileArn in SQLite; whoami against the
-  // SAME active CLI session can supply it (#993). Imported stays authoritative.
-  const resolvedProfileArn = imported.profileArn ?? identity.profileArn;
+  // Same-session whoami is the live identity. SQLite state can still hold the
+  // previous account's profile after a CLI switch; treating that leftover ARN
+  // as accountId upserts the new login onto the old slot (#4435). The #993
+  // session-switch guard above already discards whoami when the token changed,
+  // so imported remains the fallback when whoami is unavailable.
+  const resolvedProfileArn = accountScopedProfileArn(identity.profileArn)
+    ?? accountScopedProfileArn(imported.profileArn);
   const metadata: KiroOAuthMetadata | undefined = (() => {
     const base = metadataFromImported(imported) ?? {};
-    if (resolvedProfileArn && !base.profileArn) base.profileArn = resolvedProfileArn;
+    if (resolvedProfileArn) base.profileArn = resolvedProfileArn;
+    else delete base.profileArn;
     return Object.keys(base).length > 0 ? base : undefined;
   })();
   return {
@@ -473,17 +501,67 @@ export function resolveKiroProfileArn(account?: Pick<KiroOAuthMetadata, "profile
   return readImportedKiroCredential()?.profileArn;
 }
 
-async function kiroTokenRefreshError(response: Response): Promise<KiroTokenRefreshError> {
+/**
+ * Resolve the profileArn actually SENT upstream, which is not always the account's own.
+ *
+ * An AWS Builder ID account authenticates through SSO OIDC and never receives an account-scoped
+ * profile ARN, so gated models reject its requests with a `profileArn`-demanding
+ * `ValidationException`. The Kiro CLI handles this by carrying a fixed service profile on Builder
+ * ID requests, and this mirrors that.
+ *
+ * Deliberately separate from `resolveKiroProfileArn`: that resolver answers "what is this
+ * account's profile", and callers that ask it — region inference, account matching, continuation
+ * scoping — must keep receiving `undefined` here. Only request construction uses this function.
+ *
+ * The fallback is gated on `authType === "aws_sso_oidc"` rather than on a missing ARN, so a
+ * `kiro_desktop` account whose profile import failed keeps producing its actionable error instead
+ * of silently borrowing a service profile that does not describe it.
+ */
+export function resolveKiroRequestProfileArn(
+  account?: Pick<KiroOAuthMetadata, "profileArn" | "authType">,
+): string | undefined {
+  return resolveKiroRequestProfile(account).profileArn;
+}
+
+/**
+ * The profileArn to send, together with WHY it was chosen.
+ *
+ * The request builder must decide the wire envelope from the same evaluation that produced the
+ * ARN. Re-deriving "is this Builder ID" from the account context alone would miss the accountless
+ * path, where the auth type comes from the locally imported credential instead: the fallback would
+ * be sent while the request was shaped as an enterprise IDE call, which is not a combination the
+ * vendor client ever produces.
+ */
+export function resolveKiroRequestProfile(
+  account?: Pick<KiroOAuthMetadata, "profileArn" | "authType">,
+): { profileArn: string | undefined; builderIdFallback: boolean } {
+  const own = resolveKiroProfileArn(account);
+  if (own) return { profileArn: own, builderIdFallback: false };
+  const authType = account !== undefined
+    ? account.authType
+    : readImportedKiroCredential()?.authType;
+  return authType === "aws_sso_oidc"
+    ? { profileArn: KIRO_BUILDER_ID_SERVICE_PROFILE_ARN, builderIdFallback: true }
+    : { profileArn: undefined, builderIdFallback: false };
+}
+
+async function kiroTokenRefreshError(response: Response, awsSsoRefresh = false): Promise<KiroTokenRefreshError> {
   let oauthError: string | undefined;
+  let refreshAttention = false;
   try {
-    const payload = await response.json() as { error?: unknown };
+    const payload = await response.json() as { error?: unknown; message?: unknown };
+    // This input-error code is attention evidence only for our AWS SSO refresh request,
+    // never a terminal grant verdict. Do not surface arbitrary upstream descriptions.
+    refreshAttention = awsSsoRefresh && response.status === 400 && payload.error === "invalid_request";
     if (typeof payload.error === "string" && KIRO_TERMINAL_REFRESH_ERRORS.has(payload.error)) {
       oauthError = payload.error;
+    } else if (!awsSsoRefresh && response.status === 401 && payload.message === "Bad credentials") {
+      oauthError = KIRO_DESKTOP_BAD_CREDENTIALS;
     }
   } catch {
     // Error bodies are untrusted and intentionally excluded from the surfaced message.
   }
-  return new KiroTokenRefreshError(response.status, oauthError);
+  return new KiroTokenRefreshError(response.status, oauthError, refreshAttention);
 }
 
 async function readTokenResponse(res: Response, oldRefresh: string): Promise<OAuthCredentials> {
@@ -551,7 +629,7 @@ async function refreshAwsSsoOidcToken(
     signal: kiroRefreshSignal(signal),
   });
   const res = await run(refresh);
-  if (!res.ok) throw await kiroTokenRefreshError(res);
+  if (!res.ok) throw await kiroTokenRefreshError(res, true);
   return readTokenResponse(res, refresh);
 }
 
@@ -597,10 +675,40 @@ function metadataForRotatedKiroCliCredential(
   };
 }
 
+/**
+ * Users of one organization share its profile ARN (#6641). A row that names its user adopts the
+ * local CLI session only when same-session whoami reports that user and the CLI still holds the
+ * matched session. A row without a user keeps the profile match only while no other stored Kiro
+ * row shares the profile. Cancellation propagates as cancellation, never as the refresh refusal.
+ */
+async function localKiroCliSessionBelongsToUser(
+  credential: OAuthCredentials,
+  local: ImportedKiroCredential,
+  runner: KiroCliRunner,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const email = kiroUserEmail(credential);
+  if (!email) {
+    return !(getAccountSet("kiro")?.accounts ?? []).some(account =>
+      account.credential.refresh !== credential.refresh && account.credential.accountId === local.profileArn);
+  }
+  const identity = await readKiroCliIdentity(runner, signal);
+  signal?.throwIfAborted();
+  if (identity.email !== email) return false;
+  let current: ImportedKiroCredential | null;
+  try {
+    current = readKiroCliSqliteCredential();
+  } catch {
+    return false;
+  }
+  return current !== null && (current.refresh || current.access) === (local.refresh || local.access);
+}
+
 export async function refreshKiroToken(
   refresh: string,
   signal?: AbortSignal,
   credential?: OAuthCredentials,
+  options: { cliRunner?: KiroCliRunner } = {},
 ): Promise<OAuthCredentials> {
   if (!refresh) throw new Error("Kiro: no refresh token available (re-run `kiro-cli login`).");
   try {
@@ -610,12 +718,23 @@ export async function refreshKiroToken(
     if (!credential) throw error;
     const local = matchingRotatedKiroCliCredential(refresh, credential);
     if (!local) throw error;
+    if (!await localKiroCliSessionBelongsToUser(credential, local, options.cliRunner ?? defaultKiroCliRunner, signal)) {
+      throw error;
+    }
     const retryMetadata = metadataForRotatedKiroCliCredential(credential, local);
-    const fresh = await refreshAwsSsoOidcToken(local.refresh, signal, {
-      ...credential,
-      refresh: local.refresh,
-      kiro: retryMetadata,
-    });
-    return { ...fresh, kiro: retryMetadata };
+    try {
+      const fresh = await refreshAwsSsoOidcToken(local.refresh, signal, {
+        ...credential,
+        refresh: local.refresh,
+        kiro: retryMetadata,
+      });
+      return { ...fresh, kiro: retryMetadata };
+    } catch (recoveryError) {
+      // A failed CLI fallback may use the desktop endpoint. Retain the original AWS SSO
+      // attention evidence on another input rejection; transient recovery stays retryable.
+      if (error.refreshAttention && recoveryError instanceof KiroTokenRefreshError
+        && recoveryError.httpStatus === 400 && recoveryError.oauthError === undefined) throw error;
+      throw recoveryError;
+    }
   }
 }

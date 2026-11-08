@@ -5,7 +5,6 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
-  renameSync,
   rmdirSync,
   unlinkSync,
   writeFileSync,
@@ -13,6 +12,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { GenerationContext } from "./state-store-sweeper";
+import { renameAtomicFile } from "./windows-atomic-replace";
 
 export const CONFIG_OWNER_FILE = ".opencodex-owner.json";
 export const CONFIG_UNINSTALL_MANIFEST = ".opencodex-uninstall.json";
@@ -40,6 +40,7 @@ const INITIAL_OWNED_PATHS = [
   "artifacts",
   "auth.json",
   "auth.store.lock",
+  "admin-api-token",
   "catalog-backup.json",
   "claude-env.sh",
   "codex-accounts.json",
@@ -60,8 +61,11 @@ const INITIAL_OWNED_PATHS = [
   "opencodex-service-task.xml",
   "opencodex-service.cmd",
   "opencodex-tray-offline.ico",
+  "opencodex-tray-offline-update.ico",
   "opencodex-tray-online.ico",
+  "opencodex-tray-online-update.ico",
   "opencodex-tray-warning.ico",
+  "opencodex-tray-warning-update.ico",
   "opencodex-tray.ps1",
   "responses-state.json",
   "runtime-port.json",
@@ -69,6 +73,7 @@ const INITIAL_OWNED_PATHS = [
   "service-state.json",
   "service.log",
   "system-env-port",
+  "thought-signature-replay.json",
   "tray-heartbeat.json",
   "tray-state.json",
   "update-job.json",
@@ -231,7 +236,10 @@ function writeManifest(configDir: string, manifest: ConfigUninstallManifest): vo
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   writeFileSync(temp, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   try {
-    renameSync(temp, path);
+    // Same Windows sharing-violation tolerance the config writer has: a
+    // scanner holding the manifest must not turn uninstall bookkeeping into a
+    // hard failure.
+    renameAtomicFile(temp, path, undefined, "config-ownership");
   } catch (error) {
     try { unlinkSync(temp); } catch { /* best effort */ }
     throw error;
@@ -259,9 +267,8 @@ function removeOwnedEntry(root: string, path: string): void {
   rmdirSync(path);
 }
 
-export function recordOwnedConfigPath(configDir: string, candidatePath: string): boolean {
-  const rel = manifestRelativePath(configDir, candidatePath);
-  if (!rel) return false;
+/** Initialize only an empty or already-owned root; do not claim a candidate path. */
+export function initializeConfigOwnership(configDir: string): boolean {
   const cacheKey = ownershipCacheKey(configDir);
   if (!existsSync(configDir)) {
     ownershipCache.delete(cacheKey);
@@ -272,6 +279,15 @@ export function recordOwnedConfigPath(configDir: string, candidatePath: string):
     ownership = loadOwnership(configDir) ?? createOwnership(configDir);
     ownershipCache.set(cacheKey, ownership);
   }
+  return ownership !== null;
+}
+
+export function recordOwnedConfigPath(configDir: string, candidatePath: string): boolean {
+  const rel = manifestRelativePath(configDir, candidatePath);
+  if (!rel) return false;
+  if (!initializeConfigOwnership(configDir)) return false;
+  const cacheKey = ownershipCacheKey(configDir);
+  const ownership = ownershipCache.get(cacheKey);
   if (!ownership) return false;
   if (ownership.manifest.paths.includes(rel)) return true;
   const manifest = {

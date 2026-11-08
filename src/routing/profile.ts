@@ -12,8 +12,8 @@ import type {
   OcxRoutingUnknownCostCapMode,
 } from "../types";
 import { codexAccountNamespaceEntries } from "../codex/account-namespaces";
-import { listComboIds, resolveComboId } from "../combos";
-import { hasOwnProvider } from "../config";
+import { resolveComboId } from "../combos/identifiers";
+import { hasOwnProvider } from "../config/provider-name";
 import { MAX_COMPATIBILITY_REQUIRED_SUITES } from "./compatibility/types";
 import { POLICY_NAMESPACE } from "./profile-namespace";
 

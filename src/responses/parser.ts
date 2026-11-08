@@ -1,3 +1,4 @@
+import { anthropicProgressEnvelope, isAnthropicProgressMirror } from "./anthropic-progress";
 import type {
   OcxAssistantMessage,
   OcxContentPart,
@@ -9,200 +10,129 @@ import type {
   OcxThinkingContent,
   OcxTool,
   OcxToolCall,
+  OcxReasoningReplayScopeRef,
 } from "../types";
-import { namespacedToolName } from "../types";
+import { createToolChoiceResolver, namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
-import { compactionItemToText } from "./compaction";
+import { providerMetadataFromResponsesFunctionCall } from "./provider-opaque-metadata";
+import { lookupReplayThoughtSignature } from "./thought-signature-replay";
+import { decodeRetainedCompaction, RETAINED_COMPACTION_PREFIX } from "./retained-compaction";
+import { CHECKPOINT_CONTINUATION_NOTE, compactionItemToText, decodeCompactionSummary, isCompactionItemType, SUMMARY_PREFIX } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
+import { hasRoutedIdentity, nameRoutedIdentity } from "../adapters/identity";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
-import { extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
+import { buildImageTool, extractHostedImageGeneration, IMAGE_GEN_TOOL_NAME } from "../images/synthetic-tool";
+import { toolSearchDescription, toolSearchParameters } from "./tool-search-compat";
 
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
+import { isObj, inputContentParts, outputTextOf, outputToToolResultContent, toolOutputContainsEncryptedContent } from "./parser-content";
+import { mapToolChoice, buildTools, customToolNamespaces } from "./parser-tools";
+import { parseTextFormat } from "./parser-text-format";
+import { externalTaskInputContent } from "./task-input";
+import { normalizeVisualizationContext } from "./visualization-directives";
+import { frameCompactionHistory } from "./compaction-history-framing";
+
+/**
+ * Wrap a remembered proxy-side signature as provider metadata for a replayed tool call.
+ *
+ * The scope is REQUIRED for a hit. `parseRequest` runs before the route and account are
+ * chosen, so a caller that has not yet bound a replay scope gets nothing rather than a
+ * signature belonging to some other thread that happened to reuse the same `call_id`.
+ */
+function replayThoughtSignatureMetadata(
+  callId: string,
+  scope: OcxReasoningReplayScopeRef | undefined,
+): { google: { thoughtSignature: string } } | undefined {
+  const signature = lookupReplayThoughtSignature(callId, scope);
+  return signature ? { google: { thoughtSignature: signature } } : undefined;
 }
 
-type InputBlock =
-  | { type: "input_text"; text: string }
-  | { type: "text"; text: string }
-  | { type: "input_image"; image_url?: string; file_id?: string; detail?: string }
-  | { type: "input_file"; file_id?: string; filename?: string; file_data?: string };
-
-/** A usable reference string, or undefined. Empty strings and non-strings are not references. */
-function nonEmptyString(value: unknown): string | undefined {
-  return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function inputContentParts(blocks: unknown): string | OcxContentPart[] {
-  if (typeof blocks === "string") return blocks;
-  // The catch-all can also hand back a non-array `content` (an object, a number), which would
-  // throw at the loop below before any per-block guard runs.
-  if (!Array.isArray(blocks)) return [];
-  const parts: OcxContentPart[] = [];
-  for (const raw of blocks) {
-    // A malformed message item fails its strict schema and falls through to inputItemSchema's
-    // permissive catch-all, so blocks reaching here are NOT guaranteed to match the declared
-    // shape. Validate each field before use, as outputToToolResultContent already does.
-    if (!isObj(raw)) continue;
-    const block = raw as InputBlock;
-    if (block.type === "input_text" || block.type === "text") {
-      if (typeof raw.text === "string") parts.push({ type: "text", text: raw.text });
-    } else if (block.type === "input_image") {
-      const b = block as { image_url?: string; file_id?: string; detail?: string };
-      const imageUrl = nonEmptyString(b.image_url);
-      const fileId = nonEmptyString(b.file_id);
-      const detail = nonEmptyString(b.detail);
-      if (imageUrl) {
-        // Preserve the image as a structured part — adapters send it as a native image block.
-        // NEVER inline the (often base64 data-URL) image_url as text: that explodes the token count.
-        parts.push({ type: "image", imageUrl, ...(detail ? { detail: normalizeImageDetail(detail) } : {}) });
-      } else if (fileId) {
-        parts.push({ type: "text", text: `[image: ${fileId}]` }); // file_id ref → no inline data
-      }
-      // No usable reference: omit the block. A "[image: ?]" marker would claim an attachment
-      // the request never carried, which is worse than dropping malformed input.
-    } else if (block.type === "input_file") {
-      const b = block as { file_id?: string; filename?: string; file_data?: string };
-      const fileId = nonEmptyString(b.file_id);
-      const fileData = nonEmptyString(b.file_data);
-      const filename = nonEmptyString(b.filename);
-      if (fileId) {
-        parts.push({ type: "text", text: `[file: ${fileId}]` });
-      } else if (fileData) {
-        // Inline file_data is often large base64. Preserve only its presence and name, never bytes.
-        parts.push({ type: "text", text: filename ? `[file: ${filename}]` : "[file: inline data]" });
-      }
-      // A bare filename is not a file resource in the Responses schema, so omit it rather than
-      // fabricating a "[file: ...]" marker for an attachment that was never sent.
-    }
-  }
-  // Collapse to a plain string only for a single TEXT part; images must stay structured.
-  if (parts.length === 1 && parts[0].type === "text") return parts[0].text;
-  return parts;
-}
-
-type OutputBlock = { type: "output_text"; text: string } | { type: "text"; text: string } | { type: "refusal"; refusal: string };
-
-function outputTextOf(blocks: unknown): OcxTextContent[] {
-  if (typeof blocks === "string") return blocks.length > 0 ? [{ type: "text", text: blocks }] : [];
-  if (!Array.isArray(blocks)) return [];
-  const out: OcxTextContent[] = [];
-  for (const raw of blocks) {
-    // Same catch-all caveat as inputContentParts: validate before use.
-    if (!isObj(raw)) continue;
-    const b = raw as OutputBlock;
-    if (b.type === "output_text" || b.type === "text") {
-      if (typeof raw.text === "string") out.push({ type: "text", text: raw.text });
-    } else if (b.type === "refusal") {
-      if (typeof raw.refusal === "string") out.push({ type: "text", text: `[refusal: ${raw.refusal}]` });
-    }
-  }
-  return out;
-}
-
-function mapToolChoice(value: unknown): OcxRequestOptions["toolChoice"] {
-  if (value === undefined || value === null) return undefined;
-  if (value === "auto" || value === "none" || value === "required") return value;
-  if (isObj(value) && "type" in value) {
-    const t = (value as { type: string }).type;
-    if ((t === "function" || t === "custom") && "name" in value) {
-      return { name: (value as { name: string }).name };
-    }
-    // Hosted image tool types (with or without a name) map to the synthetic image_gen wire name.
-    if (t === "image_generation" || t === "image_gen") {
-      return { name: IMAGE_GEN_TOOL_NAME };
-    }
-    if (t === "allowed_tools" && Array.isArray(value.tools)) {
-      const names = value.tools
-        .map(allowedToolName)
-        .filter((name): name is string => Boolean(name));
-      return names.length > 0
-        ? { allowedTools: [...new Set(names)], mode: value.mode === "required" ? "required" : "auto" }
-        : "none";
-    }
-    return "auto";
+/**
+ * Repair one bounded inbound-history corruption: a JSON object literal that lost exactly
+ * its opening brace (observed as `code":"…}` after `{"` went missing, taking the key's
+ * opening quote with it). Only a text that ends with `}` and parses into an object once
+ * the brace is restored counts — anything looser keeps the tolerated-{} fallback so
+ * freeform text that merely resembles JSON is never rewritten.
+ */
+function repairJsonObjectEnvelope(text: string): Record<string, unknown> | undefined {
+  if (!text.endsWith("}")) return undefined;
+  // A body that still opens with a quoted key lost only `{`; the observed shape lost
+  // `{"` together, taking the key's opening quote with it. Both restorations must parse
+  // into an object, so freeform text that merely resembles JSON is never rewritten.
+  const candidate = text.startsWith('"') ? `{${text}` : `{"${text}`;
+  try {
+    const parsed: unknown = JSON.parse(candidate);
+    if (isObj(parsed)) return parsed;
+  } catch {
+    /* fall through to the tolerated-{} path */
   }
   return undefined;
 }
 
-function allowedToolName(tool: unknown): string | undefined {
-  if (!isObj(tool)) return undefined;
-  if (typeof tool.name === "string" && tool.name.length > 0) return tool.name;
-  if (tool.type === "web_search" || tool.type === "web_search_preview") return WEB_SEARCH_TOOL_NAME;
-  if (tool.type === "image_generation" || tool.type === "image_gen") return IMAGE_GEN_TOOL_NAME;
-  if (tool.type === "tool_search") return "tool_search";
+/**
+ * Repair the observed MiMo tool-call corruption: the model emits its proprietary
+ * `</function></tool_call>` closing tags INSIDE the JSON string value of the
+ * function arguments, and drops the JSON object's closing brace. Strip the
+ * suffix, restore the brace, and only accept the repair when the result parses
+ * into an object.
+ */
+function repairMimoToolCallEnvelope(text: string): Record<string, unknown> | undefined {
+  const suffix = "</function></tool_call>";
+  if (!text.endsWith(suffix)) return undefined;
+  const stripped = text.slice(0, -suffix.length);
+  if (!stripped.startsWith("{")) return undefined;
+  // A trailing brace or quote can itself belong to the unterminated string.
+  // Try only the three observed envelope endings, accepting an object parse.
+  for (const candidate of [stripped, `${stripped}}`, `${stripped}"}`]) {
+    try {
+      const parsed: unknown = JSON.parse(candidate);
+      if (isObj(parsed)) return parsed;
+    } catch {
+      /* try the next bounded envelope ending */
+    }
+  }
   return undefined;
 }
 
-function buildTools(tools: unknown[] | undefined): OcxTool[] | undefined {
-  if (!tools) return undefined;
-  const out: OcxTool[] = [];
-  const normalizeParameters = (raw: unknown): Record<string, unknown> => {
-    if (isObj(raw) && raw.type === "object") return raw;
-    return { ...(isObj(raw) ? raw : {}), type: "object" };
-  };
-  const pushFn = (t: Record<string, unknown>, namespace?: string) => {
-    const tool: OcxTool = {
-      name: t.name as string,
-      description: (t.description as string) ?? "",
-      parameters: normalizeParameters(t.parameters),
-    };
-    if (t.strict !== undefined) tool.strict = t.strict as boolean;
-    if (namespace) tool.namespace = namespace;
-    out.push(tool);
-  };
-  for (const t of tools) {
-    if (!isObj(t)) continue;
-    if (t.type === "function" && typeof t.name === "string") {
-      pushFn(t);
-    } else if (t.type === "namespace" && Array.isArray(t.tools)) {
-      // MCP tools arrive grouped under a namespace tool; flatten the inner function tools so
-      // chat-completions models receive them (round-trip restores the namespace in the bridge).
-      const ns = typeof t.name === "string" ? t.name : undefined;
-      for (const inner of t.tools as unknown[]) {
-        if (isObj(inner) && inner.type === "function" && typeof inner.name === "string") pushFn(inner, ns);
+/**
+ * Decode a function call's serialized arguments the way history replay tolerates them: empty
+ * or non-JSON text becomes `{}` instead of failing every later turn, and the bounded
+ * lost-brace and MiMo closing-tag corruptions above are repaired. Shared with the direct Chat decoder
+ * (`src/protocols/codecs/chat-ir.ts`) so both decode the same call to the same object.
+ */
+export function functionCallArgumentsFromText(callId: string, rawArguments: string | undefined): Record<string, unknown> {
+  let args: Record<string, unknown> = {};
+  const rawArgs = rawArguments?.trim();
+  if (rawArgs) {
+    try {
+      const parsed: unknown = JSON.parse(rawArgs);
+      if (isObj(parsed)) args = parsed;
+    } catch {
+      // Corruptions observed on Xiaomi MiMo routed requests, each with a bounded
+      // repair so a serialized call the model can still see is restored instead
+      // of replaying {} forever.
+      const mimoRepaired = repairMimoToolCallEnvelope(rawArgs);
+      if (mimoRepaired !== undefined) {
+        args = mimoRepaired;
+        console.warn(`[parser] function_call ${callId} repaired MiMo tool-call envelope (tags inside string)`);
+        return args;
+      }
+      // One observed serialization corruption loses exactly the JSON object's opening
+      // brace; the closed envelope is tight enough to repair back into a call the
+      // routed model can still see and retry, instead of replaying {} forever.
+      const repaired = repairJsonObjectEnvelope(rawArgs);
+      if (repaired === undefined) {
+        console.warn(`[parser] function_call ${callId} has non-JSON arguments; defaulting to {}`);
+      } else {
+        args = repaired;
+        console.warn(`[parser] function_call ${callId} arguments lost the JSON opening brace; repaired from history`);
       }
     }
-    else if (t.type === "custom" && typeof t.name === "string") {
-      // Freeform custom tool (e.g. apply_patch). Chat models can't emit a lark grammar, so expose a
-      // function with a single string `input` carrying the raw tool body; the bridge relays the model's
-      // call back as a custom_tool_call (Codex's freeform handler rejects a function_call → fatal abort).
-      out.push({
-        name: t.name,
-        description: (t.description as string) ?? "",
-        parameters: { type: "object", properties: { input: { type: "string", description: "Raw tool input. For apply_patch, begin exactly with `*** Begin Patch` (no trailing `***`), then use its standard patch envelope." } }, required: ["input"] },
-        freeform: true,
-      });
-    }
-    else if (t.type === "tool_search") {
-      // Client-executed tool discovery — the gateway to deferred tools (subagents, extra MCP tools).
-      // Expose as a function so chat models can call it; the bridge relays it as a tool_search_call.
-      out.push({
-        name: "tool_search",
-        description: (t.description as string) ?? "Search for additional tools to load for the next turn.",
-        parameters: (isObj(t.parameters) ? t.parameters : {
-          type: "object",
-          properties: {
-            query: { type: "string", description: "Search query for tools to load." },
-            limit: { type: "number", description: "Maximum number of tools to return." },
-          },
-          required: ["query"],
-        }) as Record<string, unknown>,
-        toolSearch: true,
-      });
-    }
-    else if (typeof t.name === "string" && t.type !== "web_search" && t.type !== "image_generation") {
-      // Any OTHER named tool (e.g. a native/computer-use tool type opencodex doesn't explicitly
-      // model) is client-executed — pass it through as a function so the routed model can read and
-      // call it naturally; the bridge relays its call as a function_call. Previously such tools were
-      // silently dropped, so the model never saw them.
-      pushFn(t);
-    }
-    // Only the OpenAI-hosted server-side tools (web_search, image_generation) are intentionally
-    // dropped — they're executed by OpenAI and can't be relayed to a routed chat model.
   }
-  return out.length > 0 ? out : undefined;
+  return args;
 }
+
+
 
 function ensureAssistantPlaceholder(messages: OcxMessage[], modelId: string, now: number): OcxAssistantMessage {
   const last = messages[messages.length - 1];
@@ -212,45 +142,6 @@ function ensureAssistantPlaceholder(messages: OcxMessage[], modelId: string, now
   return placeholder;
 }
 
-/**
- * Tool-call output content. Preserves images (e.g. Codex `view_image` returns
- * `input_image` items): returns content parts when any image is present, else a plain joined string.
- * Never inlines an image_url as text (that would explode the token count).
- */
-function outputToToolResultContent(output: string | unknown[] | undefined): string | OcxContentPart[] {
-  if (typeof output === "string") return output;
-  if (!Array.isArray(output)) return "";
-  const parts: OcxContentPart[] = [];
-  let hasImage = false;
-  for (const raw of output) {
-    if (!isObj(raw)) continue;
-    if (raw.type === "output_text" || raw.type === "text" || raw.type === "input_text") {
-      if (typeof raw.text === "string") parts.push({ type: "text", text: raw.text });
-    } else if (raw.type === "refusal" && typeof raw.refusal === "string") {
-      parts.push({ type: "text", text: `[refusal: ${raw.refusal}]` });
-    } else if (raw.type === "input_image" && typeof raw.image_url === "string") {
-      parts.push({ type: "image", imageUrl: raw.image_url, ...(typeof raw.detail === "string" ? { detail: normalizeImageDetail(raw.detail) } : {}) });
-      hasImage = true;
-    } else if (raw.type === "encrypted_content") {
-      // codex-rs FunctionCallOutputContentItem::EncryptedContent — opaque to routed models.
-      parts.push({ type: "text", text: "[encrypted content omitted]" });
-    }
-  }
-  if (!hasImage) return parts.map(p => (p.type === "text" ? p.text : "")).join("");
-  return parts;
-}
-
-function toolOutputContainsEncryptedContent(output: string | unknown[] | undefined): boolean {
-  return Array.isArray(output) && output.some(raw => isObj(raw) && raw.type === "encrypted_content");
-}
-
-/**
- * codex-rs ImageDetail allows "original", but chat-completions providers only accept
- * auto|low|high on image_url.detail — degrade "original" to "high" (the codex default).
- */
-function normalizeImageDetail(detail: string): string {
-  return detail === "original" ? "high" : detail;
-}
 
 function findToolById(messages: OcxMessage[], callId: string): { name: string; namespace?: string } {
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -293,15 +184,54 @@ function attachPendingReasoningToCallOwner(
 
 const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
-export function parseRequest(body: unknown): OcxParsedRequest {
+export function hasValidatedActiveReasoningEffort(options: Pick<OcxRequestOptions, "reasoning">): boolean {
+  return options.reasoning !== undefined && options.reasoning !== "none";
+}
+
+
+/**
+ * Name this request's destination in an instruction text inherited from a stored session block.
+ *
+ * Returns the input unchanged when it carries no sentence of ours, which is every request that has
+ * not gone through a sub-agent spawn. The catalog block is model-neutral on disk (#5217) and some
+ * routed adapters build their own system text instead of calling `identifyRoutedModel`, so both the
+ * neutral line and a sentence naming an earlier model are handled here — request time is the first
+ * point where the destination model is known.
+ */
+function nameDestinationText(text: string, modelId: string): string {
+  return hasRoutedIdentity(text) ? nameRoutedIdentity(text, modelId) : text;
+}
+
+function nameDestinationContent(
+  content: string | OcxContentPart[],
+  modelId: string,
+): string | OcxContentPart[] {
+  if (typeof content === "string") return nameDestinationText(content, modelId);
+  let changed = false;
+  const parts = content.map((part) => {
+    if (part.type !== "text" || !hasRoutedIdentity(part.text)) return part;
+    changed = true;
+    return { ...part, text: nameRoutedIdentity(part.text, modelId) };
+  });
+  return changed ? parts : content;
+}
+
+export function parseRequest(
+  body: unknown,
+  parseOptions?: { replayCacheScope?: OcxReasoningReplayScopeRef },
+): OcxParsedRequest {
+  const replayCacheScope = parseOptions?.replayCacheScope;
   const replayedInputPrefixLength = previousResponseReplayPrefixLength(body);
   const parsed = responsesRequestSchema.safeParse(body);
   if (!parsed.success) {
     throw new Error(`responses parse error: ${parsed.error.message}`);
   }
-  const data = parsed.data;
+  const data = frameCompactionHistory(parsed.data);
   const now = Date.now();
   const messages: OcxMessage[] = [];
+  // Built before the item loop: a custom_tool_call echoed back in `input` needs the
+  // namespace from the request's own tool catalog to survive the round trip.
+  const customToolNamespacesByName = customToolNamespaces(data.tools);
   const systemPrompt: string[] = [];
   // Responses reasoning siblings belong to the following assistant, including across call items.
   // Keep them off the message list until that assistant arrives; turn boundaries clear the array.
@@ -317,17 +247,27 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     }
     return holder;
   };
+  const preservePendingReplay = () => {
+    const replay = pendingReasoning.filter(entry => entry.envelopeSigned || entry.part.redacted?.length);
+    if (replay.length > 0) {
+      ensureAssistantPlaceholder(messages, data.model, now).content.push(...replay.map(entry => entry.part));
+    }
+  };
   // Tool specs surfaced by a prior tool_search (deferred tools, e.g. subagents). Codex does not
   // re-list these in `tools`, but chat models can only call listed tools — so we re-inject them.
   const loadedToolSpecs: unknown[] = [];
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
   let compactionRequest = false;
+  let decodedCheckpoint = false;
   let contextCompactionBoundary = false;
   let continuationConversationMessageIndex: number | undefined;
 
   if (typeof data.instructions === "string" && data.instructions.length > 0) {
-    systemPrompt.push(data.instructions);
+    // #5217: this is the stored session instruction block. A sub-agent spawned on a DIFFERENT model
+    // receives the parent's copy verbatim, so the identity sentence inside it names the parent
+    // unless it is renamed here, where the destination model is known.
+    systemPrompt.push(nameDestinationText(data.instructions, data.model));
   }
 
   if (typeof data.input === "string") {
@@ -336,8 +276,16 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   } else if (data.input) {
     for (let inputIndex = 0; inputIndex < data.input.length; inputIndex++) {
       const item = data.input[inputIndex];
+      if (inputIndex > 0 && isAnthropicProgressMirror(item, anthropicProgressEnvelope(data.input[inputIndex - 1]))) continue;
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
       const itemRole = (item as { role?: string }).role;
+      const externalTaskInput = effectiveType === "function_call_output" ? externalTaskInputContent(item) : undefined;
+      // A signed/opaque assistant-only turn still owns its replay blocks, even
+      // without a following assistant text or tool call to drain the pending list.
+      if (effectiveType === "agent_message" || externalTaskInput !== undefined
+        || (effectiveType === "message" && ["user", "developer", "system"].includes(itemRole ?? ""))) {
+        preservePendingReplay();
+      }
       // Raw protocol items do not map one-to-one onto context messages. Capture the boundary while
       // both representations are available so later metadata can stay before conversation in both.
       if (
@@ -346,6 +294,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         && continuationConversationMessageIndex === undefined
         && (
           effectiveType === "agent_message"
+          || externalTaskInput !== undefined
           || (effectiveType === "message" && (itemRole === "user" || itemRole === "assistant"))
         )
       ) {
@@ -369,8 +318,8 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         continue;
       }
 
-      if (effectiveType === "compaction" || effectiveType === "compaction_summary" || effectiveType === "context_compaction") {
-        // A stored summary from a previous compaction. Decode our ocx1 envelope into plain text so
+      if (isCompactionItemType(effectiveType)) {
+        // A stored summary from a previous compaction. Decode our ocx1/ocx2 envelopes into plain text so
         // the routed model keeps the compacted context; real OpenAI-encrypted blobs degrade to a note.
         // `context_compaction` (encrypted_content optional) is codex-rs's local-compaction marker;
         // with no payload it is a pure marker (the summary follows as its own user message), so it
@@ -380,7 +329,15 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         if (inputIndex >= replayedInputPrefixLength) contextCompactionBoundary = true;
         const encrypted = (item as { encrypted_content?: unknown }).encrypted_content;
         if (effectiveType === "context_compaction" && typeof encrypted !== "string") continue;
+        if (typeof encrypted === "string" && decodeCompactionSummary(encrypted) !== null) decodedCheckpoint = true;
         pendingReasoning.length = 0;
+        if (typeof encrypted === "string" && encrypted.startsWith(RETAINED_COMPACTION_PREFIX)) {
+          const retained = decodeRetainedCompaction(encrypted);
+          if (!retained) throw new Error("Invalid OpenCodex retained compaction envelope");
+          messages.push({ role: "user", content: `${SUMMARY_PREFIX}\n\n${retained.summary}`, timestamp: now });
+          messages.push(...retained.reasoning.map(content => ({ role: "user" as const, content, timestamp: now })));
+          continue;
+        }
         messages.push({
           role: "user",
           content: compactionItemToText(typeof encrypted === "string" ? encrypted : undefined),
@@ -422,15 +379,28 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           case "system": {
             pendingReasoning.length = 0;
             const text = inputContentParts(msg.content);
-            const flat = typeof text === "string" ? text : text.map(p => (p.type === "text" ? p.text : "")).join("");
-            if (flat.length > 0) systemPrompt.push(flat);
+            const flat = typeof text === "string"
+              ? text
+              : text.map(p => (p.type === "text" || p.type === "document" ? p.text : "")).join("");
+            // #5217: a system-role item is instruction text, exactly like `instructions` and a
+            // developer item, so it needs the same request-time naming — it lands in the system
+            // block verbatim, and Codex replays the parent's copy to a sub-agent on another model.
+            if (flat.length > 0) systemPrompt.push(nameDestinationText(flat, data.model));
             break;
           }
           case "user":
           case "developer": {
             pendingReasoning.length = 0;
             const content = inputContentParts(msg.content);
-            messages.push({ role: msg.role, content, timestamp: now });
+            messages.push({
+              role: msg.role,
+              // #5217: Codex replays the PARENT session's instruction block as the worker's
+              // developer message, so a sub-agent on another model inherits an identity sentence
+              // naming the parent. Only this proxy's own sentence is rewritten, and only on a
+              // developer item; user turns are the caller's content and stay byte-identical.
+              content: msg.role === "developer" ? nameDestinationContent(content, data.model) : content,
+              timestamp: now,
+            });
             break;
           }
           case "assistant": {
@@ -458,7 +428,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         const envelope = typeof reasoning.encrypted_content === "string"
           ? decodeReasoningEnvelope(reasoning.encrypted_content)
           : null;
-        const thinkingText = envelope?.txt || text;
+        const thinkingText = envelope?.txt ?? text;
 
         // Kiro reasoning round-trip: a krc-only item carries nothing renderable — it is provider
         // state for the assistant turn that ALREADY closed, because Kiro emits its
@@ -474,7 +444,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
 
         // Native/non-ocxr1 encrypted-only reasoning is opaque here. Do not create a detached
         // assistant turn or invent replayable plaintext/signatures from the encrypted payload.
-        if (thinkingText.length > 0) {
+        if (thinkingText.length > 0 || envelope?.sig || envelope?.red?.length) {
           const part: OcxThinkingContent = {
             type: "thinking",
             thinking: thinkingText,
@@ -485,7 +455,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           const envelopeSigned = typeof envelope?.sig === "string";
           const previous = pendingReasoning[pendingReasoning.length - 1];
 
-          if (!envelopeSigned && previous && !previous.envelopeSigned) {
+          if (!envelopeSigned && !part.redacted && previous && !previous.envelopeSigned && !previous.part.redacted) {
             previous.part = {
               ...part,
               thinking: `${previous.part.thinking}\n${part.thinking}`,
@@ -498,19 +468,10 @@ export function parseRequest(body: unknown): OcxParsedRequest {
       }
 
       if (effectiveType === "function_call") {
-        const call = item as { id?: string; call_id: string; name: string; arguments?: string; namespace?: string };
+        const call = item as { id?: string; call_id: string; name: string; arguments?: string; namespace?: string; extra_content?: unknown };
         // Tolerate empty/non-JSON arguments (e.g. a no-arg tool call serialized as "") instead of
         // throwing — a single poisoned history item would otherwise 400 every subsequent turn.
-        let args: Record<string, unknown> = {};
-        const rawArgs = call.arguments?.trim();
-        if (rawArgs) {
-          try {
-            const parsed: unknown = JSON.parse(rawArgs);
-            if (isObj(parsed)) args = parsed;
-          } catch {
-            console.warn(`[parser] function_call ${call.call_id} has non-JSON arguments; defaulting to {}`);
-          }
-        }
+        const args = functionCallArgumentsFromText(call.call_id, call.arguments);
         // Do NOT map Responses item `id` (fc_/ctc_/…) onto `thoughtSignature`. That field is
         // reserved for Gemini/Antigravity opaque thought tokens; forwarding item ids as
         // thoughtSignature 400s Antigravity (Base64 / TYPE_BYTES). Continuity for CCA comes from
@@ -519,16 +480,32 @@ export function parseRequest(body: unknown): OcxParsedRequest {
           type: "toolCall", id: call.call_id, name: call.name, arguments: args,
           ...(call.namespace ? { namespace: call.namespace } : {}),
         };
+        // Provider-opaque metadata (e.g. a Gemini thought signature) travels with the call so a
+        // history-replayed or previous_response_id turn rebuilds the same signed part instead of
+        // depending on the same-process replay cache (issue #1735). Real clients do not echo
+        // extra_content on replay, so fall back to the proxy-side store keyed by call_id.
+        const providerMetadata = providerMetadataFromResponsesFunctionCall(call)
+          ?? (typeof call.call_id === "string"
+            ? replayThoughtSignatureMetadata(call.call_id, replayCacheScope)
+            : undefined);
+        if (providerMetadata) toolCall.providerMetadata = providerMetadata;
         assistantHolderWithReasoning().content.push(toolCall);
         continue;
       }
 
       if (effectiveType === "custom_tool_call") {
         const call = item as { id?: string; call_id: string; name: string; input: string };
+        const remembered = typeof call.call_id === "string" ? replayThoughtSignatureMetadata(call.call_id, replayCacheScope) : undefined;
+        // Reconstruct the namespace the request declared this tool under. The wire item
+        // carries only the bare name, so without this the round trip loses it and adapters
+        // replay the call as an unnamespaced tool the provider may not expose.
+        const customNamespace = customToolNamespacesByName.get(call.name);
         const toolCall: OcxToolCall = {
           type: "toolCall", id: call.call_id, name: call.name,
           arguments: { input: call.input ?? "" },
           customWireName: call.name,
+          ...(customNamespace ? { namespace: customNamespace } : {}),
+          ...(remembered ? { providerMetadata: remembered } : {}),
         };
         assistantHolderWithReasoning().content.push(toolCall);
         continue;
@@ -541,9 +518,11 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         const callId = call.call_id ?? call.id;
         if (callId) {
           const command = Array.isArray(call.action?.command) ? call.action.command : [];
+          const remembered = replayThoughtSignatureMetadata(callId, replayCacheScope);
           assistantHolderWithReasoning().content.push({
             type: "toolCall", id: callId, name: "shell",
             arguments: command.length > 0 ? { command } : {},
+            ...(remembered ? { providerMetadata: remembered } : {}),
           });
         }
         continue;
@@ -562,9 +541,11 @@ export function parseRequest(body: unknown): OcxParsedRequest {
         // history stays complete (otherwise the model re-issues tool_search forever).
         const call = item as { id?: string; call_id?: string; arguments?: unknown };
         const callId = call.call_id ?? call.id ?? "";
+        const remembered = callId ? replayThoughtSignatureMetadata(callId, replayCacheScope) : undefined;
         assistantHolderWithReasoning().content.push({
           type: "toolCall", id: callId, name: "tool_search",
           arguments: isObj(call.arguments) ? call.arguments : {},
+          ...(remembered ? { providerMetadata: remembered } : {}),
         });
         continue;
       }
@@ -601,6 +582,11 @@ export function parseRequest(body: unknown): OcxParsedRequest {
       }
 
       if (effectiveType === "function_call_output") {
+        if (externalTaskInput !== undefined) {
+          pendingReasoning.length = 0;
+          messages.push({ role: "user", content: externalTaskInput, timestamp: now });
+          continue;
+        }
         const output = item as { call_id: string; output?: string | unknown[] };
         attachPendingReasoningToCallOwner(messages, output.call_id, pendingReasoning);
         pendingReasoning.length = 0;
@@ -630,6 +616,7 @@ export function parseRequest(body: unknown): OcxParsedRequest {
       }
     }
   }
+  preservePendingReplay();
   if (data.previous_response_id && continuationConversationMessageIndex === undefined) {
     continuationConversationMessageIndex = messages.length;
   }
@@ -637,6 +624,15 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   const declaredTools = buildTools(data.tools as unknown[] | undefined) ?? [];
   const loadedTools = buildTools(loadedToolSpecs) ?? [];
   const loadedToolNames = new Set(loadedTools.map(t => namespacedToolName(t.namespace, t.name)));
+  const wireOwners = new Map<string, OcxTool>();
+  for (const tool of [...declaredTools, ...loadedTools]) {
+    const wireName = namespacedToolName(tool.namespace, tool.name);
+    const previous = wireOwners.get(wireName);
+    if (previous && (previous.namespace !== tool.namespace || previous.name !== tool.name || previous.freeform !== tool.freeform || previous.toolSearch !== tool.toolSearch)) {
+      throw new Error(`ambiguous tool catalog: multiple logical tools map to wire name ${wireName}`);
+    }
+    wireOwners.set(wireName, tool);
+  }
   const seenTools = new Set<string>();
   const mergedTools = [...declaredTools, ...loadedTools]
     .filter(t => {
@@ -648,6 +644,10 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     .map(t => loadedToolNames.has(namespacedToolName(t.namespace, t.name))
       ? { ...t, loadedFromToolSearch: true }
       : t);
+  // #6764: the decoded checkpoint is ordinary user text on this route. Say in the system prompt
+  // what it is, so a retained earlier request that it reports as completed is not repeated.
+  // A compaction request is a summarizer turn and must not be told to continue.
+  if (decodedCheckpoint && !compactionRequest) systemPrompt.push(CHECKPOINT_CONTINUATION_NOTE);
   const context: OcxContext = {
     ...(systemPrompt.length > 0 ? { systemPrompt } : {}),
     messages,
@@ -662,6 +662,15 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     options.stopSequences = typeof data.stop === "string" ? [data.stop] : data.stop;
   }
   const tc = mapToolChoice(data.tool_choice);
+  if (tc && typeof tc === "object") {
+    const selectors = "allowedTools" in tc ? tc.allowedTools : [tc.name];
+    const resolver = createToolChoiceResolver(mergedTools);
+    for (const selector of selectors) {
+      if (resolver.candidateCount(selector) > 1) {
+        throw new Error(`ambiguous tool_choice name: ${selector}`);
+      }
+    }
+  }
   if (tc !== undefined) options.toolChoice = tc;
   if (data.parallel_tool_calls !== undefined) options.parallelToolCalls = data.parallel_tool_calls;
   // Upstream codex-rs converts "ultra" to "max" at the inference boundary (core/src/client.rs
@@ -673,7 +682,8 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     options.reasoning = requestedEffort;
   }
   const summaryMode = data.reasoning?.summary;
-  if (!summaryMode || summaryMode === "none") options.hideThinkingSummary = true;
+  const reasoningActive = hasValidatedActiveReasoningEffort(options);
+  if (summaryMode === "none" || (!summaryMode && !reasoningActive)) options.hideThinkingSummary = true;
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
   if (data.service_tier !== undefined) options.serviceTier = data.service_tier;
@@ -697,7 +707,9 @@ export function parseRequest(body: unknown): OcxParsedRequest {
   return {
     modelId: data.model,
     ...(data.previous_response_id ? { previousResponseId: data.previous_response_id } : {}),
-    context,
+    // Codex App visualization references in the private-use form are invisible to some models;
+    // hand every model the app's ASCII directive instead (visualization-directives.ts).
+    context: normalizeVisualizationContext(context),
     stream: data.stream === true,
     options,
     _rawBody: body,
@@ -710,27 +722,5 @@ export function parseRequest(body: unknown): OcxParsedRequest {
     ...(textFormat ? { _structuredOutput: true } : {}),
     ...(compactionRequest ? { _compactionRequest: true } : {}),
     ...(contextCompactionBoundary ? { _contextCompactionBoundary: true } : {}),
-  };
-}
-
-/**
- * The Responses `text.format` object when it requests structured output (json_schema or
- * json_object), undefined otherwise. Acceptance is identical to the boolean detector this
- * replaces; unknown or malformed formats are ignored, never rejected, so the native
- * passthrough keeps forwarding whatever the caller sent via `_rawBody`.
- */
-function parseTextFormat(text: unknown): OcxRequestOptions["textFormat"] {
-  if (!isObj(text)) return undefined;
-  const format = (text as { format?: unknown }).format;
-  if (!isObj(format)) return undefined;
-  const f = format as { type?: unknown; name?: unknown; description?: unknown; schema?: unknown; strict?: unknown };
-  if (f.type === "json_object") return { type: "json_object" };
-  if (f.type !== "json_schema") return undefined;
-  return {
-    type: "json_schema",
-    ...(typeof f.name === "string" ? { name: f.name } : {}),
-    ...(typeof f.description === "string" ? { description: f.description } : {}),
-    ...(isObj(f.schema) ? { schema: f.schema as Record<string, unknown> } : {}),
-    ...(typeof f.strict === "boolean" ? { strict: f.strict } : {}),
   };
 }

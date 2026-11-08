@@ -1,3 +1,5 @@
+import type { OcxConfig } from "../types";
+import { configuredAnthropicInstance } from "../providers/anthropic-instance";
 /**
  * Quota-aware policy scoring (RI-07).
  *
@@ -41,6 +43,12 @@ function codexAccountQuotaEvidence(accountId: string, plan?: string): RouteQuota
   const percents = [
     ...(monthly ? [] : [quota.weeklyPercent]),
     quota.monthlyPercent,
+    // The burst window is upstream-enforced independently of the governing window, so an
+    // account at 97% here has 3% headroom whatever its weekly figure says. This was invisible
+    // while the header parser misfiled 5h readings into weeklyPercent - routing saw the burst
+    // by accident. Once that is fixed, omitting it here reports 88% headroom for an account
+    // that is one request away from a 429. computeCodexUsageScore already folds it in.
+    quota.shortPercent,
   ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   const maxPercent = percents.length > 0 ? Math.max(...percents) : undefined;
   // Credits-only snapshots prove neither usage nor exhaustion. Unknown must not
@@ -49,6 +57,10 @@ function codexAccountQuotaEvidence(accountId: string, plan?: string): RouteQuota
   const resets = [
     ...(monthly ? [] : [quota.weeklyResetAt]),
     quota.monthlyResetAt,
+    // Pair the reset with the window that can actually gate the next request: a burst-limited
+    // account recovers in hours, and reporting a distant weekly reset would defer a retry that
+    // is already safe.
+    quota.shortResetAt,
   ].filter((value): value is number => typeof value === "number" && Number.isFinite(value))
     .filter(value => value > Date.now());
   return {
@@ -88,7 +100,7 @@ export function codexPoolQuotaEvidence(accounts: readonly CodexPoolQuotaAccount[
   };
 }
 
-export function quotaEvidenceForCandidate(input: QuotaEvidenceInput): RouteQuotaEvidence {
+export function quotaEvidenceForCandidate(input: QuotaEvidenceInput, config?: Pick<OcxConfig, "providers">): RouteQuotaEvidence {
   if (input.provider === "openai" && input.codexAccountId) {
     // listAccountQuotas() is the reconciled quota snapshot: config-generation
     // reconciliation prunes removed accounts. Other eligibility dimensions
@@ -103,8 +115,10 @@ export function quotaEvidenceForCandidate(input: QuotaEvidenceInput): RouteQuota
     return codexAccountQuotaEvidence(input.codexAccountId, input.codexAccountPlan);
   }
 
-  if (input.provider === "anthropic" && input.accountRef) {
-    const quota = getCachedProviderAccountQuota("anthropic", input.accountRef);
+  const instance = config ? configuredAnthropicInstance(config, input.provider)
+    : input.provider === "anthropic" ? "anthropic" : undefined;
+  if (instance && input.accountRef) {
+    const quota = getCachedProviderAccountQuota(instance, input.accountRef);
     if (quota) {
       const family = anthropicFamilyWindow(input.model, quota.customWindows ?? []);
       const percents = [quota.fiveHourPercent, quota.weeklyPercent, quota.monthlyPercent, family?.percent]

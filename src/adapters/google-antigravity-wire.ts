@@ -1,14 +1,36 @@
 import { createHash } from "node:crypto";
 import type { OcxContentPart, OcxParsedRequest } from "../types";
-import { antigravityUserAgent } from "./client-fingerprint";
+import { antigravityCliUserAgent, antigravityUserAgent } from "./client-fingerprint";
 
 /**
- * Antigravity request User-Agent. Mirrors the real Antigravity CLI UA
- * (`antigravity/cli/{ver} (aidev_client; os_type=darwin; arch=arm64)`) so the request fingerprint
+ * Antigravity request User-Agent. Mirrors the real Antigravity IDE UA
+ * (`antigravity/ide/{ver} (aidev_client; os_type=windows; arch=amd64)`) so the request fingerprint
  * matches the OAuth credential — the prior literal `"antigravity"` was a giveaway no real client
- * sends. A `GOOGLE_ANTIGRAVITY_USER_AGENT` override still wins.
+ * sends. The IDE client family is also required to unlock newer agent models (the backend 404s
+ * CLI-shaped UAs for `gemini-3.7-*`). A `GOOGLE_ANTIGRAVITY_USER_AGENT` override still wins.
  */
-export const ANTIGRAVITY_REQUEST_UA = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT || antigravityUserAgent();
+export const ANTIGRAVITY_REQUEST_UA = antigravityUserAgent();
+
+/**
+ * Antigravity CLI User-Agent. CCA serves Gemini 4 Argon only to the CLI client family, and it
+ * 404s other agent models (`gemini-3.7-flash-tiered`, `gemini-3.1-pro-low`) under it, so the
+ * choice is per wire model: see `antigravityUserAgentForWireModel`.
+ */
+export const ANTIGRAVITY_CLI_REQUEST_UA = antigravityCliUserAgent();
+
+/**
+ * Model discovery (`:fetchAvailableModels`) uses the CLI UA so Argon's wire ids are listed;
+ * under the IDE UA they are absent.
+ */
+export const ANTIGRAVITY_DISCOVERY_UA = ANTIGRAVITY_CLI_REQUEST_UA;
+
+/** Wire ids CCA serves only to the CLI client family (verified 2026-10-14). */
+const ANTIGRAVITY_CLI_ONLY_WIRE_MODEL = /^gemini-4-argon(?:-(?:low|medium|high))?$/;
+
+/** The User-Agent an Antigravity inference request for `wireModelId` must carry. */
+export function antigravityUserAgentForWireModel(wireModelId: string): string {
+  return ANTIGRAVITY_CLI_ONLY_WIRE_MODEL.test(wireModelId) ? ANTIGRAVITY_CLI_REQUEST_UA : ANTIGRAVITY_REQUEST_UA;
+}
 
 /**
  * Whether a stored `OcxToolCall.thoughtSignature` is a REAL upstream Gemini signature versus a
@@ -28,6 +50,11 @@ export const ANTIGRAVITY_REQUEST_UA = process.env.GOOGLE_ANTIGRAVITY_USER_AGENT 
  */
 export function isLikelyRealThoughtSignature(sig: string | undefined): boolean {
   if (typeof sig !== "string" || sig.length < 16) return false;
+  // The validator-bypass sentinel is something WE fabricate for outbound requests when no real
+  // signature exists. It is alphanumeric with underscores, so it would otherwise satisfy every
+  // check below and be re-ingested as genuine — cached, replayed, and eventually treated as
+  // evidence that a turn was signed. It is never a real signature.
+  if (sig === "skip_thought_signature_validator") return false;
   // Reject synthetic Responses/tool-call ids and Anthropic tool-use ids (`_` or `-` separators).
   if (/^(fc|ctc|tsc|call|msg|rs|resp|reasoning|item|ws|toolu|tool|func|function)[-_]/i.test(sig)) return false;
   // Real Gemini thought signatures are opaque base64/base64url blobs: only [A-Za-z0-9+/_=-].
@@ -39,8 +66,11 @@ function firstUserText(parsed: OcxParsedRequest): string | undefined {
   for (const msg of parsed.context.messages) {
     if (msg.role !== "user") continue;
     if (typeof msg.content === "string") return msg.content;
-    const first = (msg.content as OcxContentPart[]).find(p => p.type === "text" && typeof p.text === "string");
-    if (first && first.type === "text") return first.text;
+    // A document part carries text too: ignoring it left a document-only opening turn with no
+    // anchor, which silently downgrades the deterministic session id to a random one.
+    const first = (msg.content as OcxContentPart[])
+      .find(p => (p.type === "text" || p.type === "document") && typeof p.text === "string");
+    if (first && (first.type === "text" || first.type === "document")) return first.text;
   }
   return undefined;
 }
@@ -71,7 +101,7 @@ export function antigravitySessionId(parsed: OcxParsedRequest): string {
   //
   // Clients that send no thread header keep the text anchor and its instability; this is a scoped
   // repair, not a universal one.
-  const text = clientThreadAnchor(parsed) ?? firstUserText(parsed);
+  const text = codexThreadAnchor(parsed).preimage ?? firstUserText(parsed);
   if (!text) return `-${Math.floor(Math.random() * 9e18).toString()}`;
   const digest = createHash("sha256").update(text, "utf8").digest();
   const masked = digest.readBigUInt64BE(0) & 0x7fffffffffffffffn;
@@ -90,9 +120,60 @@ export function antigravitySessionId(parsed: OcxParsedRequest): string {
  * functionCall identity (name+args), so a shared id does not misattribute them. Instability, not
  * collision, is the failure mode this function exists to prevent.
  */
-function clientThreadAnchor(parsed: OcxParsedRequest): string | undefined {
-  const threadId = parsed._clientThreadId?.trim();
-  return threadId ? `codex-thread:${threadId}` : undefined;
+function codexThreadAnchor(parsed: OcxParsedRequest): {
+  kind: "parent-and-own" | "parent-only" | "absent";
+  preimage?: string;
+} {
+  // `_clientThreadId` carries `x-codex-parent-thread-id`, which every parallel child of one
+  // parent presents identically, so anchoring on it alone collapsed concurrent children onto a
+  // single upstream Cloud Code Assist session (#5033).
+  //
+  // A thread id is only unique WITHIN its parent, which is why `codexConversationIdentity` keys
+  // on both. #5054 anchored on the child alone and therefore only moved the collision: two
+  // parents can each have a child of the same id (#5058). The pair is the identity, joined by a
+  // NUL so the encoding is injective: no Codex id contains one, so a pair cannot be re-read as a
+  // different pair, nor as the parent-only anchor below.
+  //
+  // Deliberately NOT the general lane key: `codexConversationKeyFor` is an HMAC under a
+  // process-random secret, so it changes across a proxy restart — and instability, not sharing,
+  // is the failure mode this derivation has to avoid. These ids are Codex's own values and
+  // survive both compaction and restart.
+  const own = parsed._codexOwnThreadId?.trim();
+  const parent = parsed._clientThreadId?.trim();
+  if (own && parent) return { kind: "parent-and-own", preimage: `codex-thread:${parent}\u0000${own}` };
+  // Parent-only clients keep the anchor they already had.
+  if (parent) return { kind: "parent-only", preimage: `codex-thread:${parent}` };
+  // A parentless ROOT deliberately omits the parent header. `src/server/context-history.ts` says
+  // so in as many words: root model requests use (session-id=root, thread-id=root) and do not
+  // fabricate a parent key. It has no pair to key on, and #5054's claim that a root presents
+  // `thread-id` equal to its parent was simply wrong.
+  //
+  // So it keeps the pre-#5054 anchor rather than gaining an own-thread one. That is not a
+  // preference: durable Antigravity replay state is keyed by model plus session id, and moving a
+  // root's anchor on upgrade strands every signature stored under the old session — the exact
+  // instability this derivation exists to avoid, introduced while fixing sharing.
+  return { kind: "absent" };
+}
+
+/**
+ * Which class of anchor {@link antigravitySessionId} derives this request's session id from.
+ *
+ * The id itself identifies a live conversation and is a Google-visible wire value, so it is not
+ * something a user can paste into a public bug report. The class is: it distinguishes the four
+ * stability regimes above — a Codex parent/child pair, a parent-only client, the content-derived
+ * text anchor that compaction can move, and the random fallback that changes every turn — while
+ * carrying no identity at all.
+ *
+ * It reads the SAME decision the id derivation reads, so the two cannot disagree about which
+ * regime a request is in. What it does not do is change how the id itself is derived: nothing
+ * about a Google-visible wire value moves because a diagnostic wants to describe it.
+ */
+export type AntigravitySessionAnchor = "parent-and-own" | "parent-only" | "text" | "none";
+
+export function antigravitySessionAnchor(parsed: OcxParsedRequest): AntigravitySessionAnchor {
+  const anchor = codexThreadAnchor(parsed);
+  if (anchor.kind !== "absent") return anchor.kind;
+  return firstUserText(parsed) ? "text" : "none";
 }
 
 /** A Gemini content part as it appears in an Antigravity request body. */

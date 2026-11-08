@@ -28,7 +28,7 @@ listesine eklenmez. Satır, gerçek bir katalog satırının sahip olduğu alan
 şekliyle eşleştirilir, bu da hatalı biçimlendirilmiş girdileri filtreler —
 önbellek kullanıcıya ait bir dosya olduğundan kimliğin bir yukarı akış
 yanıtından geldiğini kanıtlamaz. Bkz. [Tam Codex hesap
-seçicileri](/tr/reference/configuration/routing/#exact-codex-account-selectors).
+seçicileri](/tr/reference/configuration/routing/#tam-codex-hesap-seçicileri).
 
 `gpt-daybreak-blue-latest`, hesap nitelikli satırlar için bu yalnızca gözlem
 kuralını takip eder ve yalın yerel izin listesine eklenmez. Ayrı, açık bir
@@ -48,11 +48,11 @@ aynı hat kimliğini `openai/gpt-daybreak-blue-latest` olarak ortaya çıkarabil
 ```
 
 Yalnızca bu tam sağlayıcı, uç nokta ve model kimliği sabitlenmiş Sol yetenek
-anlık görüntüsünü alır: 372.000 bağlam, 334.800 otomatik sıkıştırma, yerel akıl
+anlık görüntüsünü alır: 922.000 bağlam, 829.800 otomatik sıkıştırma, yerel akıl
 yürütme merdiveni ve yerel Codex araç meta verileri. İstek yine de
 `gpt-daybreak-blue-latest` gönderir; opencodex bunu Sol'a yeniden yazmaz, yalın
 bir satır oluşturmaz ve hesap yetkisi vermez. Ayrı olarak faturalandırılan
-`openai-apikey/daybreak-blue-latest` API satırı farklı bir rotadır ve 1.050.000
+`openai-apikey/daybreak-blue-latest` API satırı farklı bir rotadır ve 922.000
 / 922.000 sınırları asla Codex girişi satırına kopyalanmaz.
 
 `codexAccountNamespaces` haritası boş olduğunda, hesap nitelikli seçici
@@ -62,7 +62,7 @@ silmeden veya tam `<seçici>/<yerel-openai-modeli>` yönlendirmesini devre dış
 bırakmadan oluşturulan nitelikli satırları gizlemek ve seçicideki yalın yerel
 satırları geri yüklemek için `false` olarak ayarlayın.
 
-API GPT-5.6 ve Daybreak girdileri 1.050.000 bağlam / 922.000 maksimum girdi
+API GPT-5.6 ve Daybreak girdileri 922.000 bağlam / 922.000 maksimum girdi
 kullanır ve `*-pro` seçici kimlikleri, günlükler, kullanım ve seçici durumu
 sanal kimliği korurken `reasoning.mode: "pro"` ile temel hat modeline
 çözümlenir. API kataloğu tam olarak on kimliğe sabitlenmiştir: `gpt-5.5`,
@@ -80,9 +80,9 @@ bir etikettir:
 gpt-5.6-sol                         # Pool veya Direct üzerinden yalın Codex girişi rotası
 <seçici>/gpt-5.6-sol                # bu seçici tarafından eşlenen saklanan Codex hesabı
 openai-apikey/gpt-5.6-sol           # API anahtarı
-openai/gpt-daybreak-blue-latest     # açık Codex iletme özel satırı (372.000)
+openai/gpt-daybreak-blue-latest     # açık Codex iletme özel satırı (922.000)
 <seçici>/gpt-daybreak-blue-latest   # kullanılabilir olduğunda gözlemlenen hesap nitelikli yerel kimlik
-openai-apikey/daybreak-blue-latest  # ayrı API anahtarı rotası (1.050.000 / 922.000)
+openai-apikey/daybreak-blue-latest  # ayrı API anahtarı rotası (922.000 / 922.000)
 ```
 
 Yeni kurulumlar ve kayıtlı modu olmayan yapılandırmalar varsayılan olarak
@@ -115,7 +115,7 @@ yönlendirir. Ayrıca uyumluluk takma adları mevcutken devre dışı bırakılm
 yerel satırları etkili katalogdan çıkarır, böylece Desktop `visibility`'yi yok
 sayarak onları yeniden canlandıramaz. Komut, devre dışı bırakma anahtarı
 anlambilimi ve güvenlik kısıtlamaları için [Codex Desktop yerel izin listesi
-uyumluluğu](/tr/guides/combos/#codex-desktop-native-allowlist-compatibility)
+uyumluluğu](/tr/guides/combos/#codex-desktop-yerel-izin-listesi-uyumluluğu)
 bölümüne bakın.
 
 ## Entegrasyon yolu
@@ -144,8 +144,7 @@ yerel yetenekleri kaldırır.
 
 ## Mevcut kararlı model kapsamı
 
-Yerel geri dönüş kümesi `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`,
-`gpt-5.3-codex-spark` ve GPT-5.6 Sol/Terra/Luna modellerini içerir. GPT-5.5/5.4
+Yerel geri dönüş kümesi `gpt-5.5` ve GPT-5.6 Sol/Terra/Luna modellerini içerir. GPT-5.5
 ailesi için opencodex, kurulu Codex kataloğunun daha zengin canlı girdilerini
 korur ve yalnızca eksik bir girdiyi sentezler. Paketlenmiş yukarı akış anlık
 görüntüsü yalnızca eski şablon yaklaşımı yerine gerçek model başına kimliği ve
@@ -153,13 +152,13 @@ meta verileri sağladığı GPT-5.6 için kullanılır.
 
 | Rota | Seçici kimlikleri ve katalog meta verileri |
 | --- | --- |
-| Codex girişi (hesap nitelikli satırlar devre dışı) | `gpt-5.6-sol`, `gpt-5.6-terra` ve `gpt-5.6-luna` gibi yalın yerel kimlikler; Pool veya Direct `codexAccountMode` aracılığıyla seçilir. GPT-5.6 satırları 372.000 tokenlik bir katalog penceresi kullanır. |
+| Codex girişi (hesap nitelikli satırlar devre dışı) | `gpt-5.6-sol`, `gpt-5.6-terra` ve `gpt-5.6-luna` gibi yalın yerel kimlikler; Pool veya Direct `codexAccountMode` aracılığıyla seçilir. GPT-5.6 satırları 922.000 tokenlik bir katalog penceresi kullanır. |
 | Codex girişi (uygun seçicilerle hesap nitelikli satırlar etkin) | Uygun seçici ve desteklenen yerel model başına bir `<seçici>/<yerel-openai-modeli>` satırı; her satır yalnızca eşlenen hesabını kullanır ve yalın yerel satırlar seçiciden gizlenir. Yerel meta veriler ve bağlam pencereleri korunur. |
-| Codex girişi (açık Daybreak iletme satırı) | Yalnızca tam `customModels` satırı kurallı `openai` sağlayıcısında yapılandırıldığında `openai/gpt-daybreak-blue-latest`. Daybreak hat kimliğini korur ve sabitlenmiş Sol yetenek anlık görüntüsünü kullanır (372.000 bağlam; 334.800 otomatik sıkıştırma). |
-| OpenAI (API anahtarı) | Tam olarak on ad alanlı satır: `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, üç `*-pro` sanal kimliği ve iki Daybreak takma adı (onunun tümü için 1.050.000 bağlam; 922.000 maksimum girdi) |
-| OpenRouter | `openrouter/openai/gpt-5.6-sol`, `openrouter/openai/gpt-5.6-terra`, `openrouter/openai/gpt-5.6-luna` (1.050.000) |
-| Cursor | Statik geri dönüş `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` ve `cursor/gpt-5.6-luna` (1.000.000) artı `cursor/grok-4.5` ve `cursor/grok-4.5-fast` (500.000) içerir; canlı hesap keşfi hangilerinin görünür kalacağına karar verir. |
-| xAI | Canlı keşif yetkilidir. Geri dönüş kataloğu `xai/grok-4.6` içerir ve varsayılan olarak `xai/grok-4.5`'tir; her ikisinin de 500.000 tokenlik pencereleri vardır. Grok 4.6, `low` / `medium` / `high` / `xhigh` (yukarı akış varsayılanı: `high`) sunarken, Grok 4.5 `high` ile durur. |
+| Codex girişi (açık Daybreak iletme satırı) | Yalnızca tam `customModels` satırı kurallı `openai` sağlayıcısında yapılandırıldığında `openai/gpt-daybreak-blue-latest`. Daybreak hat kimliğini korur ve sabitlenmiş Sol yetenek anlık görüntüsünü kullanır (922.000 bağlam; 829.800 otomatik sıkıştırma). |
+| OpenAI (API anahtarı) | Tam olarak on ad alanlı satır: `gpt-5.5`, `gpt-5.6`, Sol/Terra/Luna, üç `*-pro` sanal kimliği ve iki Daybreak takma adı (onunun tümü için 922.000 bağlam; 922.000 maksimum girdi) |
+| OpenRouter | `openrouter/openai/gpt-5.6-sol`, `openrouter/openai/gpt-5.6-terra`, `openrouter/openai/gpt-5.6-luna` (922.000) |
+| Cursor | Statik geri dönüş `cursor/gpt-5.6-sol`, `cursor/gpt-5.6-terra` ve `cursor/gpt-5.6-luna` (1.000.000) ile Grok 4.5, 4.6 ve 4.7 için normal/Fast satırları (500.000) içerir; 4.6 ve 4.7 ayrıca `xhigh` sunar. Canlı hesap keşfi hangi satırların görünür kalacağını belirler. |
+| xAI | Canlı keşif yetkilidir. Geri dönüş kataloğu `xai/grok-4.6` ve `xai/grok-4.7` içerir; varsayılan model `xai/grok-4.5` olarak kalır. Üçünün de bağlam penceresi 500.000 tokendir. Grok 4.6 ve 4.7 `low` / `medium` / `high` / `xhigh` (yukarı akış varsayılanı: `high`) sunarken, Grok 4.5 `high` ile durur. |
 
 Sabitlenmiş GPT-5.6 girdileri tam yukarı akış merdivenini korur. Sol ve Terra
 `low`'dan `ultra`'ya kadar sunar; Luna `max` ile durur. Sol varsayılan olarak
@@ -283,6 +282,26 @@ Desktop izin listesi için bir denetim sunana kadar:
   uygulamaz ve yönlendirilen modelleri normal şekilde listeler.
 
 ## Model durumunu yenileme
+## Yerel kota geri dönüş kısıtı
+
+Codex uygulaması yerel beş saatlik kotasını tükettiğinde bir rezerv yedek modeline geçip seçicideki diğer satırları soluklaştırabilir. [#2813](https://github.com/lidge-jun/opencodex/issues/2813) numaralı raporda görüldüğü gibi bu kısıtlama, ilgisiz sağlayıcı kimlik bilgileri kullanan ve ChatGPT kotasından hiç tüketmeyen opencodex yönlendirmeli satırları da gizliyor.
+
+Bu kısıt istek proxy'ye ulaşmadan önce istemci tarafında uygulanır, dolayısıyla opencodex onu kaldıramaz. Yönlendirilen satırlar `visibility: "list"` ile yazılır, katalog filtrelemesi yalnızca `disabledModels` ve her sağlayıcının `selectedModels` değerine bakar ve hiçbir kota değeri yönlendirilen görünürlüğe katılmaz.
+
+Yönlendirilen bir modeli açıkça seçmek seçiciden geçmez. Modeli `config.toml` içinde ayarlayın:
+
+```toml
+model = "anthropic/claude-sonnet-5"
+```
+
+ya da doğrudan gönderin:
+
+```bash
+ocx access test anthropic/claude-sonnet-5 --protocol responses
+```
+
+Her iki yol da **istek proxy'ye ulaştıktan sonra** doğru yönlendirilir; bu testlerle kapsanıyor. Ancak Codex masaüstü uygulaması rezerv modu etkinken yapılandırılan modeli göndermez: rezerv durumunu kendi `wham/usage` sorgusundan (`luna_reserve` upsell'i ve hâlâ izinli bir `gpt-reserve` ek limiti) belirler ve istek çıkmadan önce model ayarını `gpt-reserve` olarak zorlar; bu yüzden `config.toml` yolu uygulama içinde ezilir. Pencere sıfırlanana kadar `ocx access test`, proxy üzerinden Claude Code (`ocx claude`) ya da doğrudan bir `/v1` istemcisi kullanın. Bkz. [Codex rezerv modunda yönlendirilmiş modeller](/guides/codex-integration/#routed-models-during-codex-reserve-mode).
+
 
 Seçici hala eski girdileri gösteriyorsa kataloğu yenileyin ve hedef Codex
 yüzeyini yeniden başlatın:
@@ -294,5 +313,4 @@ ocx sync
 opencodex, katalog görünürlüğü, önceliği veya meta verileri her değiştiğinde
 `models_cache.json` dosyasını kasıtlı olarak eski bir önbellek sarmalayıcısıyla
 yeniden yazar, böylece bir sonraki Codex model yenilemesi yeni kataloğu okur.
-
 

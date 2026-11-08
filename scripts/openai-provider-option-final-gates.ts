@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { scanEvidence } from "./openai-provider-option-evidence-scan";
+import { getTestRunnerBun } from "./lib/test-runner-bun";
 
 export interface GateSpec {
   name: string;
@@ -42,22 +43,22 @@ export async function runGateSequence(plan: GateSpec[], deps: GateDeps): Promise
 }
 
 const focusedTests = [
-  "tests/openai-provider-option.test.ts",
-  "tests/openai-provider-option-migration.test.ts",
-  "tests/openai-provider-option-startup.test.ts",
-  "tests/openai-provider-option-e2e.test.ts",
-  "tests/openai-provider-option-tooling.test.ts",
-  "tests/provider-registry-parity.test.ts",
-  "tests/provider-payload.test.ts",
-  "tests/codex-account-mode-state.test.ts",
-  "tests/router.test.ts",
-  "tests/codex-routing.test.ts",
-  "tests/server-auth.test.ts",
-  "tests/codex-catalog.test.ts",
-  "tests/codex-quota-prime.test.ts",
-  "tests/provider-quota.test.ts",
-  "tests/server-images.test.ts",
-  "tests/server-search.test.ts",
+  "tests/adapters/openai/openai-provider-option.test.ts",
+  "tests/adapters/openai/openai-provider-option-migration.test.ts",
+  "tests/adapters/openai/openai-provider-option-startup.test.ts",
+  "tests/adapters/openai/openai-provider-option-e2e.test.ts",
+  "tests/adapters/openai/openai-provider-option-tooling.test.ts",
+  "tests/providers/provider-registry-parity.test.ts",
+  "tests/gui/provider-payload.test.ts",
+  "tests/gui/codex-account-mode-state.test.ts",
+  "tests/routing/router.test.ts",
+  "tests/codex-integration/codex-routing.test.ts",
+  "tests/server/server-auth.test.ts",
+  "tests/codex-integration/codex-catalog.test.ts",
+  "tests/codex-integration/codex-quota-prime.test.ts",
+  "tests/providers/provider-quota.test.ts",
+  "tests/server/server-images.test.ts",
+  "tests/server/server-search.test.ts",
 ];
 const staleContractPattern = [
   ["openai", "multi"].join("-"),
@@ -70,7 +71,7 @@ export function finalGatePlan(root: string, evidenceDir: string, unitRoot = dirn
   const env = { ...process.env, OCX_EVIDENCE_DIR: evidenceDir } as Record<string, string>;
   const unitPath = relative(root, unitRoot);
   return [
-    { name: "openai-provider-option-e2e", command: ["bun", "test", "tests/openai-provider-option-e2e.test.ts"], cwd: root, env },
+    { name: "openai-provider-option-e2e", command: ["bun", "test", "tests/adapters/openai/openai-provider-option-e2e.test.ts"], cwd: root, env },
     { name: "provider-option-focused", command: ["bun", "test", "--isolate", ...focusedTests], cwd: root, env },
     { name: "isolated-runtime-smoke", command: ["bun", "scripts/openai-provider-option-runtime-smoke.ts", "--unit-root", unitPath, "--evidence-dir", evidenceDir], cwd: root },
     { name: "live-key-status", command: ["bun", "scripts/openai-provider-option-runtime-smoke.ts", "--check-live-key", "--unit-root", unitPath, "--evidence-dir", evidenceDir], cwd: root },
@@ -91,8 +92,8 @@ export function finalGatePlan(root: string, evidenceDir: string, unitRoot = dirn
     {
       name: "scoped-diff-check",
       command: ["git", "diff", "--check", "--", "README.md", "readme/README.ko.md", "readme/README.zh-CN.md", "structure",
-        "docs-site/src/content/docs", "devlog/_chase/_model", "tests/openai-provider-option-e2e.test.ts",
-        "tests/openai-provider-option-tooling.test.ts", "tests/fixtures/openai-provider-option-migration-child.ts",
+        "docs-site/src/content/docs", "devlog/_chase/_model", "tests/adapters/openai/openai-provider-option-e2e.test.ts",
+        "tests/adapters/openai/openai-provider-option-tooling.test.ts", "tests/fixtures/openai-provider-option-migration-child.ts",
         "scripts/openai-provider-option-runtime-child.ts", "scripts/openai-provider-option-runtime-smoke.ts",
         "scripts/openai-provider-option-evidence-scan.ts", "scripts/openai-provider-option-final-gates.ts",
         "scripts/openai-hardening-live-policy.ts", "scripts/openai-hardening-runtime-env.ts",
@@ -126,7 +127,7 @@ if (import.meta.main) {
   const paths = ["030_e2e.json", "030_client_history.json", "030_runtime_smoke.json", "030_gate_summary.txt"].map(name => join(evidenceDir, name));
   const run = async (gate: GateSpec): Promise<GateResult> => {
     process.stdout.write(`[gate] ${gate.name}\n`);
-    const child = Bun.spawn(gate.command, {
+    const child = Bun.spawn(gate.command[0] === "bun" && gate.command[1] === "test" ? [getTestRunnerBun(), ...gate.command.slice(1)] : gate.command, {
       cwd: gate.cwd,
       env: gate.env ? { ...process.env, ...gate.env } : process.env,
       stdin: "ignore",

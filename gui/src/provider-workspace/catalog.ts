@@ -8,6 +8,7 @@
  * Binning rules (applied in priority order):
  *  1. disabled === true              -> disabled
  *  2. keyOptional === true           -> ready  (key not required — not the same as free pricing)
+ *     subscription CLI adapter       -> ready  (`claude-cli`: the CLI owns the login; see subscription-cli.ts)
  *  3. authMode === "oauth"           -> ready  (credentials managed externally)
  *  4. authMode === "forward"         -> ready  (passes caller credentials through)
  *  5. authMode === "local"           -> ready  (local runtime, no key required)
@@ -23,11 +24,14 @@
  * over free.
  */
 
+import { isSubscriptionCliProvider } from "./subscription-cli";
+
 /**
  * Shape of a single provider value as it appears in the proxy config map.
  * The provider name is the Record key, not a field here.
  */
 export interface WorkspaceProvider {
+  anthropicOAuthInstance?: "anthropic2";
   adapter: string;
   baseUrl: string;
   hasApiKey?: boolean;
@@ -38,6 +42,8 @@ export interface WorkspaceProvider {
   models?: string[];
   /** Whether the proxy fetches the provider's live model catalog (default true). */
   liveModels?: boolean;
+  /** Optional upstream HTTP version pin. Cursor defaults to HTTP/2 when omitted. */
+  upstreamHttpVersion?: "auto" | "http1.1" | "h1" | "http2" | "h2";
   authMode?: "key" | "forward" | "oauth" | "local" | string;
   keyOptional?: boolean;
   /** Free pricing (may still require an API key). */
@@ -45,8 +51,20 @@ export interface WorkspaceProvider {
   disabled?: boolean;
   note?: string;
   allowPrivateNetwork?: boolean;
+  preserveResponsesReasoningContent?: boolean;
+  requestPacing?: {
+    enabled?: boolean;
+    requestsPerMinute?: number;
+    minIntervalMs?: number;
+    maxConcurrentRequests?: number;
+    models?: Record<string, { requestsPerMinute?: number; minIntervalMs?: number; maxConcurrentRequests?: number }>;
+    keySelection?: "active" | "round-robin";
+    keys?: { requestsPerMinute?: number; minIntervalMs?: number; maxConcurrentRequests?: number };
+  };
   /** Codex account routing mode for the canonical `openai` forward provider. */
   codexAccountMode?: "direct" | "pool";
+  /** Derived state of the two xAI Grok Responses model-adapter entries. */
+  xaiResponsesOptInState?: boolean | "mixed";
 }
 
 /** Three-way pricing/ownership tier for a ready provider row. */
@@ -97,6 +115,23 @@ function normalizedBaseUrl(value: string): string | undefined {
   }
 }
 
+const CANONICAL_PROVIDER_PROTOCOL = new URL(CODEX_FORWARD_BASE_URL).protocol;
+function providerEndpoint(host: string, ...path: string[]): string {
+  return `${CANONICAL_PROVIDER_PROTOCOL}//${host}/${path.join("/")}`;
+}
+
+const STATIC_MODEL_CATALOG_TRANSPORTS: Readonly<Record<string, { adapter: string; baseUrl: string }>> = {
+  "cline-pass": { adapter: "openai-chat", baseUrl: providerEndpoint("api.cline.bot", "api", "v1") },
+  "mimo-free": { adapter: "mimo-free", baseUrl: providerEndpoint("api.xiaomimimo.com", "api", "free-ai", "openai", "chat") },
+};
+
+/** Keep the Providers toggle aligned with the backend's canonical static-catalog boundary. */
+export function providerSupportsLiveModelDiscovery(name: string, provider: WorkspaceProvider): boolean {
+  const canonical = STATIC_MODEL_CATALOG_TRANSPORTS[name];
+  if (!canonical || provider.adapter !== canonical.adapter) return true;
+  return normalizedBaseUrl(provider.baseUrl) !== normalizedBaseUrl(canonical.baseUrl);
+}
+
 /** Loopback host check shared with the provider-kind classifier (WP080a). */
 export function hasLoopbackBaseUrl(baseUrl: string): boolean {
   try {
@@ -108,7 +143,11 @@ export function hasLoopbackBaseUrl(baseUrl: string): boolean {
 }
 
 function isConfigurationReady(p: WorkspaceProvider): boolean {
+  // A subscription CLI row is ready by adapter alone: `keyOptional` is enriched from the
+  // registry only for the canonical `claude-cli` name, and a renamed or hand-authored row using
+  // that adapter still never reads a key.
   return p.keyOptional === true ||
+    isSubscriptionCliProvider(p) ||
     p.authMode === "oauth" ||
     p.authMode === "forward" ||
     p.authMode === "local" ||
@@ -137,10 +176,13 @@ export function isAccountProvider(name: string, p: WorkspaceProvider): boolean {
 /**
  * Free pricing (badge / filter / sort): `freeTier`, keyless free (`keyOptional`),
  * local runtimes, or loopback. Forward passthrough is NOT free — those are
- * account providers. Does **not** imply ready-without-key — use
- * `binProviderStatus` for readiness.
+ * account providers, and a subscription CLI row (`claude-cli`) is NOT free either:
+ * its `keyOptional` means the CLI owns the credential and bills the user's
+ * subscription, so it sorts, filters and groups with the paid API rows. Does **not**
+ * imply ready-without-key — use `binProviderStatus` for readiness.
  */
 export function isFreeProvider(p: WorkspaceProvider): boolean {
+  if (isSubscriptionCliProvider(p)) return false;
   return p.freeTier === true
     || p.keyOptional === true
     || p.authMode === "local"

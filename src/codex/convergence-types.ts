@@ -14,7 +14,7 @@
  * behavior at its own commit, which a runtime placeholder here would break.
  */
 import type { OcxConfig } from "../types";
-import type { ProviderModelDiscoveryFilter } from "../providers/registry";
+import type { ProviderModelDiscoveryFilter, ProviderModelDiscoveryPredicate } from "../providers/registry";
 
 /**
  * The non-CAS JSON record for the Codex integration.
@@ -34,7 +34,7 @@ export interface CodexIntegrationRecord {
 }
 
 export interface CodexHistoryState {
-  status: "converged" | "pending" | "running" | "blocked" | "unknown" | "not-evaluated";
+  status: "adoption-pending" | "converged" | "pending" | "running" | "blocked" | "unknown" | "not-evaluated";
   /**
    * Why it is not converged, when it is not. These are terminal observations
    * for one attempt, not reasons to collapse the durable retry schedule.
@@ -161,8 +161,29 @@ export type CatalogDisposition =
   | { status: "skipped";
       reason: "not-requested" | "catalog-unavailable" | "busy" | "stale" | "refused";
       retryable: boolean }
-  | { status: "failed"; reason: "provider-auth" | "provider-network" | "disk";
-      phase: "gather" | "commit"; retryable: boolean; partialWrite: boolean };
+  | { status: "failed";
+      /**
+       * `disk` used to absorb every unclassified failure, so a malformed request and a
+       * genuine ENOSPC were indistinguishable and both reported non-retryable (#1784).
+       */
+      reason: "provider-auth" | "provider-network" | "disk" | "request-invalid" | "admission" | "internal";
+      phase: "gather" | "commit"; retryable: boolean; partialWrite: boolean;
+      /** Allowlisted cause summary. Closed vocabularies only -- never message text. */
+      cause?: CatalogFailureCause };
+
+/**
+ * Why a catalog operation failed, in terms safe to return from the management plane.
+ *
+ * Both fields are closed sets on purpose. An `Error.constructor.name` is dependency- or
+ * input-influenced (any thrown custom class names itself) and an `Error.message` routinely
+ * carries paths, home directories and account identifiers, none of which may cross this
+ * boundary.
+ */
+export type CatalogFailureCause = {
+  kind: "invalid-request" | "lock-busy" | "io" | "unknown";
+  /** Recognized errno/code token, when the underlying error carried one. */
+  code?: "ENOSPC" | "EACCES" | "EPERM" | "EROFS" | "ENOENT" | "SQLITE_BUSY";
+};
 
 /**
  * The ONLY way Codex-owned bytes are written. Startup, ensure, /api/sync, the
@@ -408,6 +429,8 @@ export interface CatalogTrustedOpenAiApiPolicySnapshot {
   readonly models?: readonly string[];
   readonly modelContextWindows?: Readonly<Record<string, number>>;
   readonly modelMaxInputTokens?: Readonly<Record<string, number>>;
+  readonly modelMaxOutputTokens?: Readonly<Record<string, number>>;
+  readonly virtualModels?: Readonly<Record<string, Readonly<{ wireModelId: string; reasoningMode: "pro" }>>>;
   readonly modelInputModalities?: Readonly<Record<string, readonly string[]>>;
   readonly modelReasoningEfforts?: Readonly<Record<string, readonly string[]>>;
 }
@@ -425,6 +448,7 @@ export interface CatalogProviderDiscoveryPolicySnapshot {
   readonly finalMethod: "GET" | "POST";
   readonly finalUrl: string;
   readonly filter: CatalogDiscoveryPolicyField<ProviderModelDiscoveryFilter | undefined>;
+  readonly preferFirst: CatalogDiscoveryPolicyField<readonly ProviderModelDiscoveryPredicate[] | undefined>;
   readonly maxResponseBytes: number;
   readonly maxModels: number;
   readonly trustedOpenAiApi: CatalogTrustedOpenAiApiPolicySnapshot;

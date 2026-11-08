@@ -1,5 +1,9 @@
 import { readConfigDiagnostics } from "../../config";
 import { registerCurrentServerResourceCleanup } from "../../lib/server-resource-ownership";
+import {
+  didRunOptionalShutdownHooks,
+  registerOptionalShutdownHook,
+} from "../../lib/optional-shutdown-hooks";
 import { queryLabStatus } from "../query";
 import { rebuildLabProjection } from "../projection/rebuild";
 import { planLabAutomationRuns } from "./planner";
@@ -57,6 +61,9 @@ let shutdownRequested = false;
 const dispatchDepsByConfigDir = new Map<string, DispatchOwner>();
 const inFlightControllers = new Map<string, AbortController>();
 const cancellingRunIds = new Set<string>();
+// Test seam: invoked after a manual run's queue row and per-run shutdown hook exist but
+// before the post-registration sweep check, so a test can land a sweep in that gap.
+let manualEnqueuePostWriteHookForTests: (() => void) | null = null;
 
 function configKey(configDir?: string): string {
   return configDir ?? "";
@@ -90,10 +97,12 @@ export function setLabAutomationDispatchDeps(deps: AutomationDispatchDeps): () =
 
   let released = false;
   let detachServerCleanup = () => {};
+  let detachShutdownHook = () => {};
   const release = () => {
     if (released) return;
     released = true;
     detachServerCleanup();
+    detachShutdownHook();
     const current = dispatchDepsByConfigDir.get(key);
     if (current?.token !== token) return;
     dispatchDepsByConfigDir.delete(key);
@@ -104,6 +113,13 @@ export function setLabAutomationDispatchDeps(deps: AutomationDispatchDeps): () =
     }
   };
   detachServerCleanup = registerCurrentServerResourceCleanup(release);
+  // Shutdown teardown is registered here, at activation, so `server/lifecycle.ts` never has
+  // to import Lab in order to stop it. Scoped to this configDir, unlike the previous
+  // unscoped call from the shutdown path.
+  detachShutdownHook = registerOptionalShutdownHook(`lab-automation:${key}`, () => {
+    requestLabAutomationShutdown();
+    stopLabAutomationScheduler(deps.configDir);
+  });
   return release;
 }
 
@@ -393,10 +409,34 @@ export async function runLabAutomationTick(configDir?: string): Promise<void> {
 
 export function startLabAutomationScheduler(configDir?: string): void {
   const key = configKey(configDir);
+  // Same late-request race as enqueueManualLabRun: a policy PUT or CLI enable can resume
+  // after the shutdown sweep already ran. Starting here would reset the latch and leave a
+  // live interval dispatching Lab work outside the completed sweep.
+  if (didRunOptionalShutdownHooks()) {
+    requestLabAutomationShutdown();
+    return;
+  }
   const currentOwner = dispatchDepsByConfigDir.get(key)?.token;
   const existing = schedulerTimers.get(key);
   if (existing) {
     if (currentOwner) existing.ownerToken = currentOwner;
+    return;
+  }
+  // The scheduler owns a live interval, so its teardown must be registered here rather
+  // than only in setLabAutomationDispatchDeps: the management API and the CLI can start a
+  // scheduler without ever installing dispatch deps (lab-automation-routes.ts
+  // applySchedulerPolicy, cli/lab.ts), and core no longer imports this module to stop it.
+  // Without this registration such a scheduler survives drainAndShutdown.
+  registerOptionalShutdownHook(`lab-automation-scheduler:${key}`, () => {
+    requestLabAutomationShutdown();
+    stopLabAutomationScheduler(configDir);
+  });
+  // The sweep may have run in the gap between the entry check and this registration; it
+  // snapshots the registry once, so a hook that landed afterwards is orphaned. Keep the
+  // latch set and never start the timer — the registration stays live so a repeat sweep
+  // still tears this scheduler down.
+  if (didRunOptionalShutdownHooks()) {
+    requestLabAutomationShutdown();
     return;
   }
   shutdownRequested = false;
@@ -438,6 +478,12 @@ export function resetLabAutomationSchedulerStateForTests(): void {
   dispatchDepsByConfigDir.clear();
   inFlightControllers.clear();
   cancellingRunIds.clear();
+  manualEnqueuePostWriteHookForTests = null;
+}
+
+/** Test-only seam for the gap between a manual run's queue write and its post-write sweep check. */
+export function setLabAutomationManualEnqueuePostWriteHookForTests(hook: (() => void) | null): void {
+  manualEnqueuePostWriteHookForTests = hook;
 }
 
 export async function enqueueManualLabRun(
@@ -445,6 +491,14 @@ export async function enqueueManualLabRun(
   configDir?: string,
   abortSignal?: AbortSignal,
 ): Promise<LabAutomationRunRecordV1 | null> {
+  // The management route is not covered by the data-plane drain gate, so a request accepted
+  // before listener teardown can reach this point after the shutdown sweep already ran. A
+  // hook registered then is never invoked; run its teardown inline instead of letting the
+  // dispatch escape shutdown.
+  if (didRunOptionalShutdownHooks()) {
+    requestLabAutomationShutdown();
+    return null;
+  }
   const now = Date.now();
   const created = mutateLabAutomationState(configDir, (state) => {
     const next = enqueuePlannedRuns(state, [planned], "manual", now);
@@ -454,8 +508,29 @@ export async function enqueueManualLabRun(
     return { state: next, value: run };
   });
   if (!created) return null;
-  // Manual execution is independent of automation enablement/layer toggles.
-  await runDispatchBatch(configDir, { manualRunId: created.runId, abortSignal });
+  // Manual execution can run without activation or a scheduler, so it must own a shutdown
+  // hook for the lifetime of its dispatch instead of relying on either of those paths.
+  const detachShutdownHook = registerOptionalShutdownHook(
+    `lab-automation-manual:${created.runId}`,
+    requestLabAutomationShutdown,
+  );
+  // The sweep may have run in the gap between the entry check and this registration; it
+  // snapshots the registry once, so a hook that landed afterwards is orphaned.
+  manualEnqueuePostWriteHookForTests?.();
+  if (didRunOptionalShutdownHooks()) {
+    requestLabAutomationShutdown();
+    detachShutdownHook();
+    // The queue row was already written; leaving it `queued` would persist a manual run no
+    // scheduler tick ever picks up while the route reports success. Cancel it and fail.
+    cancelLabAutomationRun(created.runId, configDir);
+    return null;
+  }
+  try {
+    // Manual execution is independent of automation enablement/layer toggles.
+    await runDispatchBatch(configDir, { manualRunId: created.runId, abortSignal });
+  } finally {
+    detachShutdownHook();
+  }
   return loadLabAutomationState(configDir).runs.find((row) => row.runId === created.runId) ?? created;
 }
 
